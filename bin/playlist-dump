@@ -337,6 +337,16 @@ def safe_name(s: str, limit=120) -> str:
     return (s or "playlist")[:limit]
 
 
+def js_runtime_args():
+    """YouTube требует JS-движок; Deno под Android не работает — используем Node.js."""
+    if shutil.which("deno"):
+        return []
+    if not shutil.which("node") and shutil.which("pkg"):
+        say("Устанавливаю Node.js (нужен для YouTube)…")
+        subprocess.call(["pkg", "install", "-y", "nodejs-lts"])
+    return ["--js-runtimes", "node"] if shutil.which("node") else []
+
+
 def spotdl_cmd():
     exe = shutil.which("spotdl")
     return [exe] if exe else [sys.executable, "-m", "spotdl"]
@@ -348,6 +358,9 @@ def run_spotdl(entries, dest: Path, name: str, numbered: bool, dry: bool):
     tmpl = "{list-position} - {artists} - {title}.{output-ext}" if numbered else "{artists} - {title}.{output-ext}"
     cmd = spotdl_cmd() + ["download", str(spotdl_file), "--output", tmpl, "--threads", "2",
                           "--save-errors", ".spotdl-errors.txt", "--m3u", f"{safe_name(name)}.m3u8"]
+    js = js_runtime_args()
+    if js:
+        cmd += ["--yt-dlp-args", " ".join(js)]
     say(f"spotDL: скачиваю {len(entries)} трек(ов)…")
     if dry:
         print("[dry-run]", " ".join(cmd))
@@ -361,9 +374,9 @@ def run_youtube(rows, dest: Path, name: str, dry: bool):
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp and not dry:
         say("Устанавливаю yt-dlp…")
-        subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
+        subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default]"])
         ytdlp = shutil.which("yt-dlp")
-    cmd_base = [ytdlp or "yt-dlp"] if ytdlp else [sys.executable, "-m", "yt_dlp"]
+    cmd_base = ([ytdlp] if ytdlp else [sys.executable, "-m", "yt_dlp"]) + js_runtime_args()
     say(f"YouTube: скачиваю {len(rows)} трек(ов), которых нет в Spotify…")
     files, failed = [], []
     for i, row in enumerate(rows, 1):

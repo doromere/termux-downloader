@@ -22,7 +22,7 @@ git clone https://github.com/doromere/termux-downloader
 bash termux-downloader/install.sh
 ```
 
-Установщик ставит `ffmpeg`, `aria2`, `git`, `yt-dlp`, `gallery-dl`, `gdown`, копирует скрипты
+Установщик ставит `ffmpeg`, `aria2`, `git`, `nodejs-lts`, `yt-dlp`, `gallery-dl`, `gdown`, копирует скрипты
 (`termux-url-opener`, `termux-file-editor`, `playlist-dump`) в `~/bin`
 и добавляет `~/bin` в `PATH`.
 
@@ -102,6 +102,13 @@ termux-url-opener --help
 ```
 
 Уведомления о завершении: установите приложение **Termux:API** и `pkg install termux-api`.
+
+## «Some YouTube downloads require Deno»
+
+YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno`) под Android не работает,
+поэтому используется **Node.js**: установщик ставит `nodejs-lts`, прописывает `--js-runtimes node`
+в `~/.config/yt-dlp/config` и в `yt_dlp_args` конфига spotDL (`~/.spotdl/config.json`).
+Скрипты передают этот флаг и сами.
 
 ## Ограничения
 
