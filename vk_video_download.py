@@ -50,8 +50,70 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_vk_player_subs(player) -> None:
+    """
+    Обход бага yt-dlp (PR #18114 / #17173): VK Video возвращает title=None в subs,
+    из-за чего sub.get('title', '.srt').split('.') падает с AttributeError.
+    """
+    if not isinstance(player, dict):
+        return
+    params = player.get('params')
+    if not isinstance(params, list):
+        return
+    for item in params:
+        if not isinstance(item, dict):
+            continue
+        subs = item.get('subs')
+        if isinstance(subs, list):
+            cleaned_subs = []
+            for sub in subs:
+                if not isinstance(sub, dict):
+                    continue
+                if not isinstance(sub.get('title'), str) or not sub.get('title'):
+                    sub['title'] = '.srt'
+                if not isinstance(sub.get('lang'), str) or not sub.get('lang'):
+                    sub['lang'] = 'ru'
+                cleaned_subs.append(sub)
+            item['subs'] = cleaned_subs
+
+
+def patch_ytdlp_vk_extractor() -> None:
+    """Патчит экстрактор VK в памяти на случай невыпущенного фикса субтитров в yt-dlp."""
+    if not YTDLP_AVAILABLE:
+        return
+    try:
+        from yt_dlp.extractor.vk import VKBaseIE, VKIE
+    except Exception:
+        return
+
+    if getattr(VKBaseIE, '_vkdl_subs_patched', False):
+        return
+
+    orig_download_payload = VKBaseIE._download_payload
+
+    def patched_download_payload(self, path, video_id, data, fatal=True):
+        payload = orig_download_payload(self, path, video_id, data, fatal=fatal)
+        if isinstance(payload, list) and payload and isinstance(payload[-1], dict):
+            _sanitize_vk_player_subs(payload[-1].get('player'))
+        return payload
+
+    orig_parse_json = VKIE._parse_json
+
+    def patched_parse_json(self, *args, **kwargs):
+        res = orig_parse_json(self, *args, **kwargs)
+        _sanitize_vk_player_subs(res)
+        return res
+
+    VKBaseIE._download_payload = patched_download_payload
+    VKIE._parse_json = patched_parse_json
+    VKBaseIE._vkdl_subs_patched = True
+
+
+patch_ytdlp_vk_extractor()
+
+
 def setup_logging(cli_mode: bool = False) -> None:
-    """Настраивает логирование в файл и (при необходимости) в консоль."""
+    """Настраивает логирование в файл и (в GUI-режиме) в консоль."""
     root_logger = logging.getLogger()
     if root_logger.handlers:
         return
@@ -59,11 +121,11 @@ def setup_logging(cli_mode: bool = False) -> None:
     root_logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    stream_handler = logging.StreamHandler()
-    # В интерактивном CLI не засоряем терминал техническими INFO-логами
-    stream_handler.setLevel(logging.ERROR if cli_mode else logging.INFO)
-    stream_handler.setFormatter(formatter)
-    root_logger.addHandler(stream_handler)
+    if not cli_mode:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
 
     log_candidates = [
         os.path.join(SCRIPT_DIR, 'vk_video_download.log'),
@@ -80,6 +142,9 @@ def setup_logging(cli_mode: bool = False) -> None:
             break
         except OSError:
             continue
+
+    if not root_logger.handlers:
+        root_logger.addHandler(logging.NullHandler())
 
 
 def is_termux() -> bool:
@@ -225,44 +290,10 @@ def download_single_video(
                 return False
 
             os.makedirs(options.output_dir, exist_ok=True)
+            patch_ytdlp_vk_extractor()
 
             timestr = datetime.datetime.now().strftime('%d%m%Y_%H%M%S_%f')[:-4]
             random_suffix = ''.join(random.choices(string.ascii_letters + string.digits, k=4))
-
-            title = "video"
-            if not options.random_name:
-                try:
-                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-                        info = ydl.extract_info(video_url, download=False) or {}
-                        title = info.get('title') or "video"
-                except Exception as e:
-                    logger.warning(f"[{serial_number}] Не удалось получить метаданные: {e}")
-
-            if stop_event.is_set():
-                if on_cancelled:
-                    on_cancelled()
-                return False
-
-            title = sanitize_filename(title, max_len=50 if options.limit_length else 120)
-
-            if options.random_name:
-                filename_base = f"{timestr}_{random_suffix}"
-                display_name = filename_base
-            else:
-                filename_base = f"{title}_{timestr}_{random_suffix}"
-                display_name = title
-
-            display_name = sanitize_filename(display_name, max_len=80)
-            if on_title:
-                on_title(display_name)
-
-            if options.separate_folder:
-                outtmpl = os.path.join(options.output_dir, filename_base, 'video.%(ext)s')
-            else:
-                outtmpl = os.path.join(options.output_dir, f'{filename_base}.%(ext)s')
-
-            if on_outtmpl:
-                on_outtmpl(outtmpl)
 
             def progress_hook(d):
                 if stop_event.is_set():
@@ -281,8 +312,11 @@ def download_single_video(
                     if on_processing:
                         on_processing(d.get('filename') or '')
 
+            init_outtmpl = os.path.join(options.output_dir, f'{timestr}_{random_suffix}.%(ext)s')
+            outtmpl = init_outtmpl
+
             ydl_opts = {
-                'outtmpl': outtmpl,
+                'outtmpl': init_outtmpl,
                 'quiet': True,
                 'no_warnings': True,
                 'logtostderr': False,
@@ -291,7 +325,65 @@ def download_single_video(
 
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([video_url])
+                    if options.random_name:
+                        filename_base = f"{timestr}_{random_suffix}"
+                        display_name = sanitize_filename(filename_base, max_len=80)
+                        if options.separate_folder:
+                            outtmpl = os.path.join(options.output_dir, filename_base, 'video.%(ext)s')
+                        else:
+                            outtmpl = os.path.join(options.output_dir, f'{filename_base}.%(ext)s')
+
+                        if isinstance(ydl.params.get('outtmpl'), dict):
+                            ydl.params['outtmpl']['default'] = outtmpl
+                        else:
+                            ydl.params['outtmpl'] = outtmpl
+
+                        if on_title:
+                            on_title(display_name)
+                        if on_outtmpl:
+                            on_outtmpl(outtmpl)
+
+                        ydl.download([video_url])
+                    else:
+                        info = ydl.extract_info(video_url, download=False, process=False)
+                        if not info:
+                            raise RuntimeError("Не удалось получить информацию о видео")
+
+                        if info.get('_type') in ('url', 'url_transparent') and not info.get('title') and info.get('url'):
+                            info = ydl.extract_info(
+                                info['url'],
+                                download=False,
+                                ie_key=info.get('ie_key'),
+                                process=False,
+                            ) or info
+
+                        if stop_event.is_set():
+                            if on_cancelled:
+                                on_cancelled()
+                            return False
+
+                        raw_title = info.get('title') or "video"
+                        title = sanitize_filename(raw_title, max_len=50 if options.limit_length else 120)
+                        filename_base = f"{title}_{timestr}_{random_suffix}"
+                        display_name = sanitize_filename(title, max_len=80)
+
+                        if options.separate_folder:
+                            outtmpl = os.path.join(options.output_dir, filename_base, 'video.%(ext)s')
+                        else:
+                            outtmpl = os.path.join(options.output_dir, f'{filename_base}.%(ext)s')
+
+                        if isinstance(ydl.params.get('outtmpl'), dict):
+                            ydl.params['outtmpl']['default'] = outtmpl
+                        else:
+                            ydl.params['outtmpl'] = outtmpl
+
+                        if on_title:
+                            on_title(display_name)
+                        if on_outtmpl:
+                            on_outtmpl(outtmpl)
+
+                        ydl.process_ie_result(info, download=True)
+
             except yt_dlp.utils.DownloadError as e:
                 if "Cancelled by user" in str(e) or stop_event.is_set():
                     cleanup_temp_files(outtmpl, options.output_dir)
