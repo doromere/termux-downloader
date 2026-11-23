@@ -1,151 +1,76 @@
-#### Version: 1.7 (старая)
-### Скрипт на python для скачивания видео с vk.com (и не только) (GIU) 
-#### Version: 2.0
+# termux-downloader
 
-![Light screenshot](https://raw.githubusercontent.com/blyamur/VK-Video-Download/main/app_screen.jpg)
+Универсальный загрузчик для Android через **Termux**: делитесь ссылкой из любого приложения
+(«Поделиться → Termux») — видео, музыка, фото и файлы скачиваются в отдельную папку для каждого сервиса.
 
-##### UPD: January 27 2025 Version 2.0
-Добавлено отображение прогресса нескольких загрузок одновременно в виде списка
-Добавлено ограничение числа параллельных загрузок (до 3х одновременных загрузок)
-Добавлена возможность отмена загрузки по кнопке + Очистка временных файлов после отмены
-Добавлена индикация Сколько всего / сколько готово
-Исправлено "Имя / источник" вместо просто процента
-Исправлено нормальная очистка имени файла
-Исправлено определение расширения файла
-Исправлено двойное “Готово” в выводе
-Исправлено некорректное обновление UI (убрано дёрганье)
+```
+Внутренняя память/Download/Termux Downloads/
+├── Spotify/  YouTube/  YouTube Music/  Twitter/  Instagram/  TikTok/  VK/ …
+├── Files/          ← прямые ссылки на файлы (.pdf, .apk, .zip, .mp4…)
+├── Shared Files/   ← файлы, которыми поделились из других приложений
+├── Other/          ← любые другие сайты
+└── .history.log    ← журнал загрузок
+```
 
+## Установка
 
-##### UPD: August 28 2025 Version 1.8
-Добавлены опции для выбора:
-Случайное имя |
-Ограничить длину до 50 симв. |
-Отдельная папка для видео |
-Исправлены некоторые проблемы
+Termux нужен из **F-Droid** или **GitHub** (версия из Google Play устарела).
 
-##### UPD: August 19 2025 Version 1.7
-Добавлено контекстное меню для мыши, что дает возможность вставлять\вырезать из поля ввода используя мышь.
+```bash
+pkg install -y git
+git clone https://github.com/doromere/termux-downloader
+bash termux-downloader/install.sh
+```
 
-##### UPD: Jule 4 2025 Version 1.6
-Добавлен вывод в лог файл и в консоль (часть строк закомментированы), оставшиеся при необходимости можете отключить
-Горячие клавиши в русской раскладке теперь работают. В связи с тем, что это особенность Tkinker, может чудить.
-Добавлена принудительная обработка в Tkinker горячих клавиш в РУС раскладке:
-Копировать *Control-c* | 
-Вставить *Control-v*  | 
-Вырезать *Control-x*  | 
-Выделить *Control-a*
+Установщик ставит `ffmpeg`, `aria2`, `git`, `yt-dlp`, `gallery-dl`, `gdown`, копирует скрипты в `~/bin`
+и добавляет `~/bin` в `PATH`.
 
-##### UPD: April 2 2024 Version 1.5
-Код переделан на использовании yt-dlp, скачивание открытых видео снова доступно. 
-Функция download_video запускается в отдельном потоке, что позволяет основному потоку выполнения программы обновлять состояние интерфейса. В процессе скачивания, текущая информация отображается в интерфейсе.
+**Spotify** (необязательно, занимает много места при сборке):
 
-##### UPD: January 01 2025 Version 1.5
-Скрипт вполне успешно скачивает с таких сервисов как: vk.com, rutube.ru, Видео Mail.Ru, youtube.com и etc.  Проверялось пользователями, подробнее [можно почитать в обсуждении](https://github.com/blyamur/VK-Video-Download/issues/2)
+```bash
+curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scripts/termux.sh | sh
+```
 
-#### Что это?
+## Использование
 
-Скрипт на python 3, с графическим интерфейсом, для скачивания видео с сервиса vk.com 
+- Ссылка → «Поделиться» → **Termux**.
+- Текст со ссылкой внутри или файл → «Поделиться» → **Termux** → кнопка **Edit**.
+- Из консоли: `termux-url-opener "ссылка"` (можно несколько ссылок в одном тексте).
 
+| Тип | Сервисы | Как скачивается |
+|---|---|---|
+| Музыка | Spotify | spotDL, альбомы/плейлисты — в подпапки |
+| Видео (меню качества) | YouTube, VK, OK, Rutube, Dzen, Facebook, Twitch, Vimeo, Dailymotion, Bilibili, Coub | yt-dlp: лучшее / 1080p / 720p / только MP3 |
+| Аудио | YouTube Music, SoundCloud, Bandcamp, Mixcloud, Yandex Music | yt-dlp → MP3 с обложкой и тегами |
+| Фото + видео | Twitter/X, Instagram, Threads, Pinterest, Bluesky, Tumblr, Imgur, Pixiv, DeviantArt, ArtStation | gallery-dl → yt-dlp |
+| Соцсети | TikTok, Reddit, Telegram (публичные посты) | yt-dlp → gallery-dl |
+| Файлы | Google Drive, GitHub, magnet / .torrent, прямые ссылки | gdown, git, aria2c, curl |
+| Остальное | любые сайты | yt-dlp → gallery-dl → curl |
 
-#### Как начать использовать?
+Короткие ссылки (`t.co`, `vk.cc`, `spotify.link`, `pin.it`, `reddit.com/…/s/…`) раскрываются автоматически.
 
-1. Скачайте архив с последней версией и распакуйте в любое удобное для вас место; 
+## Cookies (X, Instagram, 18+ и т.п.)
 
-2. Установите необходимые компоненты и зависимости если такая необходимость имеется;
+Файл cookies в формате Netscape (например, из расширения «Get cookies.txt LOCALLY»):
 
-3. Запустите файл (скрипт) *vk_video_download.py* ;
+```
+~/.config/termux-downloads/cookies/twitter.txt
+~/.config/termux-downloads/cookies/instagram.txt
+~/.config/termux-downloads/cookies/cookies.txt   ← общий для всех сервисов
+```
 
-4. В появившемся окне вставьте ссылку на видео в поле ввода и нажмите кнопку *Скачать видео*;
+Имя файла — название папки сервиса строчными буквами, пробелы → `_` (`youtube_music.txt`).
 
-5. В случае удачного скачивания, появится уведомление, а видео будет сохранено в папке downloads
+## Обслуживание
 
-> Ссылка должна быть вида: *https://vk.com/video-100000000_100000000* 
+```bash
+termux-url-opener --update   # обновить yt-dlp, gallery-dl, gdown
+termux-url-opener --help
+```
 
+Уведомления о завершении: установите приложение **Termux:API** и `pkg install termux-api`.
 
+## Ограничения
 
-#### Возможные проблемы
-
-- Не вставляется ссылка в поле ввода
-> ~У вас скорее всего включена русская раскладка клавиатуры, переключите на английскую.~
-
-> Обновитесь до последней версии, проблема должна быть решена
-
-
-
-- При закрытии окна программы, консоль продолжает выполняться
-> Баг связанн с продолжающимися процессами в фоне, будет решен в перспективе
-
-- Приложение (скрипт) во время скачивание зависает
-> Это особенность работы, в это время в фоне идет скачивание, по окончанию скачивания скрипт сам отвиснет.
-
-- Видео не скачивается
-> Видео или закрыто для доступа посторонним или имеет формат\источник не поддерживаемый yt-dlp
-
-- У файлов после скачивания  формат .unknown_video
-> Переименуйте в .mp4? как правило этого достаточно, чтобы решить проблему
-
-- Куда скачивается готовое видео?
-> В директорию downloads, находящуюся  там же где размещается ваш скрипт vk_video_download.py
-
-- В unix системах возможна [ошибка](https://github.com/blyamur/VK-Video-Download/issues/4) связанная с иконкой
-> необходимо закомментировать строку 158: ```#root.iconbitmap('./theme/icon.ico')```
-
----
-#### Для работы вам понадобится только содержимое папки *theme* и файл *vk_video_download.py*
-
-*  **vk_video_download.py** - скрипт для скачивания видео с vk.com 
-
-*  **theme** - Папка с темой оформления (стили, иконка и пр.)
-
-*  **requirements.txt** - Зависимости
-
-
-Команда для установка необходимых компонентов
-
-    pip install -r requirements.txt
-    
-Или отдельная установка yt-dlp
-
-    python3 -m pip install -U yt-dlp
-    
-Команда на сборку exe файла в pyinstaller: 
-
-    pyinstaller vk_video_download.py --noconsole --onefile --icon=icon.ico
-
-Или можно воспользоваться [GUI for Pyinstaller based on Tkinker](https://github.com/blyamur/GUI-Pyinstaller-Pichuga)
-    
----
-***Скрипт был протестирован только в Windows с использованием версии Python 3.10.2***
-
-
-#### Полезные ссылки:
-
-[GUI for Pyinstaller based on Tkinker](https://github.com/blyamur/GUI-Pyinstaller-Pichuga)
-
-[yt-dlp Installation](https://github.com/yt-dlp/yt-dlp/wiki/Installation)
-
-[yt-dlp Manual](https://github.com/yt-dlp/yt-dlp)
-
-[Requests manual](https://github.com/psf/requests)
-
-[Tkinker theme: Sun-Valley](https://github.com/rdbende/Sun-Valley-ttk-theme) - [rdbende](https://github.com/rdbende/)
-
-[Tkinker theme: Spring-Noon](https://github.com/blyamur/Spring-Noon-ttk-theme) - [blyamur](https://github.com/blyamur/)
-
-[Visit the author's blog](https://blog/mons.ws?p=4485)
-
-#### Copyrights and Licenses
-Not for commercial use.
-
-
-*Thanks for reading :heart_eyes_cat:*
-> Спасибо за чтение!
-
-
-#### Did you find this useful?! | Вы нашли это  полезным ?!
-
-Happy to hear that :) *If You want to help me, you can buy me a cup of coffee :coffee: ( [yoomoney](https://yoomoney.ru/to/41001158104834) or [ko-fi](https://ko-fi.com/monseg) )* 
-
-> Рад это слышать :) Если вы хотите мне помочь, вы можете угостить меня чашечкой кофе 
-  
-© 2024 From Russia with ❤ 
+Не поддерживаются сервисы с DRM (Apple Music, Deezer, Netflix), подкасты Spotify, музыка VK,
+закрытые чаты Telegram. Yandex Music часто требует cookies.
