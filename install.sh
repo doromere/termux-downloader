@@ -9,7 +9,11 @@ RAW="https://raw.githubusercontent.com/doromere/termux-downloader/main"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 echo "==> Доступ к памяти телефона"
-[ -d "$HOME/storage/shared" ] || { termux-setup-storage; sleep 4; }
+if [ ! -d "$HOME/storage/shared" ]; then
+  termux-setup-storage
+  for _ in $(seq 1 30); do [ -d "$HOME/storage/shared" ] && break; sleep 1; done
+  [ -d "$HOME/storage/shared" ] || echo "   ! Нет доступа к памяти — разрешите его и запустите install.sh ещё раз."
+fi
 
 echo "==> Пакеты Termux"
 pkg install -y ffmpeg curl git aria2
@@ -23,32 +27,42 @@ fi
 echo "==> yt-dlp, gallery-dl, gdown ($PY)"
 "$PY" -m pip install -U "yt-dlp[default]" gallery-dl gdown
 
-echo "==> yt-dlp и spotDL: использовать Node.js вместо Deno"
-mkdir -p "$HOME/.config/yt-dlp"
-grep -qs -- '--js-runtimes' "$HOME/.config/yt-dlp/config" || echo '--js-runtimes node' >> "$HOME/.config/yt-dlp/config"
-if command -v spotdl >/dev/null 2>&1; then
-  [ -f "$HOME/.spotdl/config.json" ] || spotdl --generate-config >/dev/null 2>&1 || true
-  "$PY" - <<'PYEOF' || true
-import json, pathlib
-p = pathlib.Path.home() / ".spotdl" / "config.json"
-if p.exists():
-    c = json.loads(p.read_text())
-    args = c.get("yt_dlp_args") or ""
-    if "--js-runtimes" not in args:
-        c["yt_dlp_args"] = (args + " --js-runtimes node").strip()
-        p.write_text(json.dumps(c, indent=4, ensure_ascii=False))
-        print("   spotDL: yt_dlp_args =", c["yt_dlp_args"])
-PYEOF
+# Скрипты сами передают «--js-runtimes node» в yt-dlp и spotDL. Строка в конфиге yt-dlp
+# нужна только для ручного запуска yt-dlp из консоли. (~/.spotdl/config.json больше не
+# трогаем: spotDL читает его лишь с --config / load_config, так что правка ничего не давала.)
+if ! grep -qs -- '--js-runtimes' "$HOME/.config/yt-dlp/config"; then
+  mkdir -p "$HOME/.config/yt-dlp"
+  echo '--js-runtimes node' >> "$HOME/.config/yt-dlp/config"
+  echo "   добавлено в ~/.config/yt-dlp/config: --js-runtimes node"
 fi
 
 echo "==> Скрипты в ~/bin"
-mkdir -p "$HOME/bin" "$HOME/.config/termux-downloads/cookies"
+CONF="$HOME/.config/termux-downloads"
+mkdir -p "$HOME/bin" "$CONF/cookies"
+chmod 700 "$CONF" "$CONF/cookies"           # cookies = доступ к аккаунтам
+chmod 600 "$CONF"/cookies/* 2>/dev/null || true
 for f in termux-url-opener termux-file-editor playlist-dump; do
-  if [ -f "$SRC/bin/$f" ]; then cp "$SRC/bin/$f" "$HOME/bin/$f"
-  else curl -fsSL "$RAW/bin/$f" -o "$HOME/bin/$f"
+  if [ -f "$SRC/bin/$f" ]; then
+    cp "$SRC/bin/$f" "$HOME/bin/$f.new"
+  else
+    # установка через curl | bash: проверяем, что пришёл скрипт, а не HTML-страница ошибки
+    curl -fsSL "$RAW/bin/$f" -o "$HOME/bin/$f.new" || {
+      echo "✘ Не удалось скачать $f. Если репозиторий приватный — используйте git clone (см. README)."
+      rm -f "$HOME/bin/$f.new"; exit 1; }
+    head -n 1 "$HOME/bin/$f.new" | grep -q '^#!' || {
+      echo "✘ Вместо $f получено что-то другое — установка прервана."; rm -f "$HOME/bin/$f.new"; exit 1; }
   fi
-  chmod +x "$HOME/bin/$f"
+  chmod 700 "$HOME/bin/$f.new"
+  mv -f "$HOME/bin/$f.new" "$HOME/bin/$f"   # атомарная замена
 done
+
+# журнал раньше лежал в общей памяти (его могли читать другие приложения) — переносим
+OLD_LOG="$HOME/storage/shared/Download/Termux Downloads/.history.log"
+if [ -f "$OLD_LOG" ]; then
+  cat "$OLD_LOG" >> "$CONF/history.log" && rm -f "$OLD_LOG"
+  chmod 600 "$CONF/history.log"
+  echo "   журнал загрузок перенесён в ~/.config/termux-downloads/history.log"
+fi
 
 grep -q 'HOME/bin' "$HOME/.bashrc" 2>/dev/null || echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
 

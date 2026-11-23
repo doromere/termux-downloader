@@ -8,9 +8,11 @@
 ├── Spotify/  YouTube/  YouTube Music/  Twitter/  Instagram/  TikTok/  VK/ …
 ├── Files/          ← прямые ссылки на файлы (.pdf, .apk, .zip, .mp4…)
 ├── Shared Files/   ← файлы, которыми поделились из других приложений
-├── Other/          ← любые другие сайты
-└── .history.log    ← журнал загрузок
+└── Other/          ← любые другие сайты
 ```
+
+Журнал загрузок хранится приватно в `~/.config/termux-downloads/history.log`
+(просмотр: `termux-url-opener --history`).
 
 ## Установка
 
@@ -50,6 +52,10 @@ curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scrip
 | Остальное | любые сайты | yt-dlp → gallery-dl → curl |
 
 Короткие ссылки (`t.co`, `vk.cc`, `spotify.link`, `pin.it`, `reddit.com/…/s/…`) раскрываются автоматически.
+
+**Подтверждения.** Торренты, прямые файлы, GitHub, «прочие сайты», а также каналы / плейлисты YouTube
+и страницы исполнителей Spotify скачиваются только после подтверждения (Enter). Если ничего не нажать
+за 30 с — загрузка отменяется. Для запуска без вопросов: `TUO_YES=1 termux-url-opener "ссылка"`.
 
 ## Плейлисты из дампов CSV / TXT (`playlist-dump`)
 
@@ -94,6 +100,9 @@ playlist-dump export https://open.spotify.com/playlist/…    # → Termux Downl
 
 Имя файла — название папки сервиса строчными буквами, пробелы → `_` (`youtube_music.txt`).
 
+Cookies — это доступ к вашим аккаунтам: держите их только в этой папке (установщик закрывает её
+правами `700`), не кладите в общую память телефона и периодически перевыпускайте (выход/вход в аккаунт).
+
 ## Обслуживание
 
 ```bash
@@ -106,9 +115,9 @@ termux-url-opener --help
 ## «Some YouTube downloads require Deno»
 
 YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno`) под Android не работает,
-поэтому используется **Node.js**: установщик ставит `nodejs-lts`, прописывает `--js-runtimes node`
-в `~/.config/yt-dlp/config` и в `yt_dlp_args` конфига spotDL (`~/.spotdl/config.json`).
-Скрипты передают этот флаг и сами.
+поэтому используется **Node.js**: установщик ставит `nodejs-lts`, скрипты передают
+`--js-runtimes node` в yt-dlp и spotDL, а в `~/.config/yt-dlp/config` флаг прописан для ручного запуска.
+При ручном запуске spotDL добавляйте `--yt-dlp-args "--js-runtimes node"`.
 
 ## Ограничения
 
@@ -117,3 +126,9 @@ YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno
 - Плейлисты Apple Music / Deezer / Tidal song.link не поддерживает: перенесите плейлист в Spotify
   (tunemymusic.com, soundiiz.com) и поделитесь ссылкой Spotify. Лимит song.link — 10 запросов в минуту.
 - Не поддерживаются подкасты Spotify, музыка VK, закрытые чаты Telegram.
+- «Любимые треки» Spotify по ссылке не скачать (нужен вход через API, только Premium) — выгрузите их
+  в CSV на tunemymusic.com и поделитесь файлом (см. `playlist-dump`).
+- Запасной поиск на YouTube (`ytsearch`) может найти не ту версию трека (кавер, live, ремикс):
+  берётся первый результат не длиннее 15 минут. Результат стоит проверить.
+- Ссылка, присланная в Termux, может прийти из любого приложения: поэтому принимаются только
+  `http(s)://` и `magnet:`, а «массовые» загрузки требуют подтверждения.
