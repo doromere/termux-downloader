@@ -1,0 +1,37 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# termux-file-editor — вызывается, когда через «Поделиться → Termux» пришёл
+# файл или текст, который не является «чистой» ссылкой
+# (например: «Смотри, какое видео https://youtu.be/...»).
+#  - текст со ссылками  → передаётся в termux-url-opener
+#  - .torrent           → скачивается через aria2c
+#  - любой другой файл  → Download/Termux Downloads/Shared Files/
+
+FILE="$1"
+ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
+OPENER="$HOME/bin/termux-url-opener"
+
+[ -f "$FILE" ] || { echo "Файл не найден: $FILE"; exit 1; }
+name=$(basename "$FILE")
+
+case "${name,,}" in
+  *.torrent) exec "$OPENER" "$FILE" ;;
+esac
+
+size=$(stat -c %s "$FILE" 2>/dev/null || echo 0)
+if [ "$size" -lt 200000 ] && grep -Iq . "$FILE" && grep -qE '(https?://|magnet:\?)' "$FILE"; then
+  text=$(cat "$FILE")
+  rm -f "$FILE"
+  exec "$OPENER" "$text"
+fi
+
+dest="$ROOT/Shared Files"
+mkdir -p "$dest"
+target="$dest/$name"
+if [ -e "$target" ]; then
+  base="${name%.*}"; ext="${name##*.}"
+  [ "$base" = "$name" ] && ext="" || ext=".$ext"
+  target="$dest/${base}_$(date +%Y%m%d-%H%M%S)$ext"
+fi
+mv "$FILE" "$target" && echo "✔ Сохранено: Download/Termux Downloads/Shared Files/$(basename "$target")"
+read -r -n 1 -s -t 10 -p "Окно закроется через 10 с (или нажмите любую клавишу)…"
+echo

@@ -1,0 +1,354 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# =====================================================================
+#  termux-url-opener — универсальный загрузчик для «Поделиться → Termux»
+#
+#  Куда сохраняется:
+#    Внутренняя память/Download/Termux Downloads/<Сервис>/
+#
+#  Команды:
+#    termux-url-opener <ссылка или текст со ссылками>
+#    termux-url-opener --update   обновить yt-dlp, gallery-dl, gdown
+#    termux-url-opener --help
+#
+#  Cookies (для X/Twitter, Instagram, 18+ на YouTube и т.п.):
+#    ~/.config/termux-downloads/cookies/<сервис>.txt   например twitter.txt
+#    ~/.config/termux-downloads/cookies/cookies.txt    общий для всех
+# =====================================================================
+
+ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
+CONF="$HOME/.config/termux-downloads"
+COOKIES_DIR="$CONF/cookies"
+LOG="$ROOT/.history.log"
+MENU_TIMEOUT=15              # секунд до автоматического выбора пункта 1
+DRY="${TUO_DRY_RUN:-0}"      # 1 = только показать команды (для отладки)
+
+if command -v python3.13 >/dev/null 2>&1; then PY=python3.13; else PY=python; fi
+
+c_ok=$'\e[32m'; c_err=$'\e[31m'; c_inf=$'\e[36m'; c_warn=$'\e[33m'; c_b=$'\e[1m'; c_0=$'\e[0m'
+say()  { printf '%s\n' "${c_inf}$*${c_0}"; }
+ok()   { printf '%s\n' "${c_ok}✔ $*${c_0}"; }
+err()  { printf '%s\n' "${c_err}✘ $*${c_0}" >&2; }
+warn() { printf '%s\n' "${c_warn}! $*${c_0}"; }
+
+run() {
+  if [ "$DRY" = 1 ]; then printf '[dry-run]'; printf ' %q' "$@"; echo; return 0; fi
+  "$@"
+}
+
+# ---------- зависимости (ставятся автоматически при первом запуске) ----------
+ensure_pip() {   # ensure_pip <команда> <пакет pip>
+  command -v "$1" >/dev/null 2>&1 && return 0
+  [ "$DRY" = 1 ] && return 0
+  say "Устанавливаю $2…"
+  "$PY" -m pip install -U "$2" && hash -r && command -v "$1" >/dev/null 2>&1
+}
+ensure_pkg() {   # ensure_pkg <команда> <пакет termux>
+  command -v "$1" >/dev/null 2>&1 && return 0
+  [ "$DRY" = 1 ] && return 0
+  say "Устанавливаю $2…"
+  pkg install -y "$2" && hash -r && command -v "$1" >/dev/null 2>&1
+}
+
+# ---------- определение сервиса ----------
+# Устанавливает SERVICE (имя папки) и TYPE (способ загрузки):
+#   spotify | video (меню) | audio | social (yt-dlp → gallery-dl)
+#   gallery (gallery-dl → yt-dlp) | gdrive | git | torrent | generic
+detect_service() {
+  local url="$1" host
+  case "$url" in magnet:*) SERVICE="Torrents"; TYPE=torrent; return;; esac
+  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#[/?#].*##; s#:[0-9]+$##; s#^(www|m|mobile)\.##' | tr 'A-Z' 'a-z')
+  case "$host" in
+    open.spotify.com|spotify.com|*.spotify.com|spotify.link)  SERVICE="Spotify";       TYPE=spotify ;;
+    music.youtube.com)                                         SERVICE="YouTube Music"; TYPE=audio ;;
+    youtube.com|*.youtube.com|youtu.be|youtube-nocookie.com)   SERVICE="YouTube";       TYPE=video ;;
+    x.com|*.x.com|twitter.com|*.twitter.com|*.twimg.com|fxtwitter.com|vxtwitter.com|fixupx.com)
+                                                               SERVICE="Twitter";       TYPE=gallery ;;
+    instagram.com|*.instagram.com|*.cdninstagram.com)          SERVICE="Instagram";     TYPE=gallery ;;
+    threads.net|*.threads.net|threads.com|*.threads.com)       SERVICE="Threads";       TYPE=gallery ;;
+    tiktok.com|*.tiktok.com)                                   SERVICE="TikTok";        TYPE=social ;;
+    vk.com|*.vk.com|vk.ru|*.vk.ru|vkvideo.ru|*.vkvideo.ru|vk.cc|*.userapi.com)
+                                                               SERVICE="VK";            TYPE=video ;;
+    ok.ru|*.ok.ru)                                             SERVICE="OK";            TYPE=video ;;
+    rutube.ru|*.rutube.ru)                                     SERVICE="Rutube";        TYPE=video ;;
+    dzen.ru|*.dzen.ru|zen.yandex.ru)                           SERVICE="Dzen";          TYPE=video ;;
+    music.yandex.ru|music.yandex.com|music.yandex.*)           SERVICE="Yandex Music";  TYPE=audio ;;
+    reddit.com|*.reddit.com|redd.it|*.redd.it)                 SERVICE="Reddit";        TYPE=social ;;
+    pinterest.*|*.pinterest.*|pin.it|*.pinimg.com)             SERVICE="Pinterest";     TYPE=gallery ;;
+    facebook.com|*.facebook.com|fb.watch|fb.com)               SERVICE="Facebook";      TYPE=video ;;
+    twitch.tv|*.twitch.tv)                                     SERVICE="Twitch";        TYPE=video ;;
+    vimeo.com|*.vimeo.com)                                     SERVICE="Vimeo";         TYPE=video ;;
+    dailymotion.com|*.dailymotion.com|dai.ly)                  SERVICE="Dailymotion";   TYPE=video ;;
+    bilibili.com|*.bilibili.com|bilibili.tv|b23.tv)            SERVICE="Bilibili";      TYPE=video ;;
+    coub.com|*.coub.com)                                       SERVICE="Coub";          TYPE=video ;;
+    soundcloud.com|*.soundcloud.com)                           SERVICE="SoundCloud";    TYPE=audio ;;
+    bandcamp.com|*.bandcamp.com)                               SERVICE="Bandcamp";      TYPE=audio ;;
+    mixcloud.com|*.mixcloud.com)                               SERVICE="Mixcloud";      TYPE=audio ;;
+    t.me|telegram.me)                                          SERVICE="Telegram";      TYPE=social ;;
+    bsky.app|*.bsky.app)                                       SERVICE="Bluesky";       TYPE=gallery ;;
+    tumblr.com|*.tumblr.com)                                   SERVICE="Tumblr";        TYPE=gallery ;;
+    imgur.com|*.imgur.com)                                     SERVICE="Imgur";         TYPE=gallery ;;
+    pixiv.net|*.pixiv.net)                                     SERVICE="Pixiv";         TYPE=gallery ;;
+    deviantart.com|*.deviantart.com)                           SERVICE="DeviantArt";    TYPE=gallery ;;
+    artstation.com|*.artstation.com)                           SERVICE="ArtStation";    TYPE=gallery ;;
+    drive.google.com|docs.google.com)                          SERVICE="Google Drive";  TYPE=gdrive ;;
+    github.com|raw.githubusercontent.com|objects.githubusercontent.com)
+                                                               SERVICE="GitHub";        TYPE=git ;;
+    *)                                                         SERVICE="Other";         TYPE=generic ;;
+  esac
+}
+
+is_direct_file() {
+  local path="${1%%[?#]*}"
+  path="${path,,}"
+  [[ "$path" =~ \.(mp4|mkv|webm|mov|avi|m4v|3gp|mp3|m4a|aac|flac|wav|ogg|opus|jpg|jpeg|png|gif|webp|heic|bmp|svg|pdf|epub|fb2|djvu|mobi|doc|docx|xls|xlsx|ppt|pptx|odt|txt|csv|zip|rar|7z|tar|gz|tgz|xz|bz2|apk|apks|xapk|exe|msi|iso|deb)$ ]]
+}
+
+# Раскрыть короткие ссылки (t.co, vk.cc, spotify.link, pin.it, reddit /s/ …)
+resolve_short() {
+  local r
+  if [ "$DRY" != 1 ]; then
+    case "$1" in
+      *://t.co/*|*://vk.cc/*|*://bit.ly/*|*://spotify.link/*|*://pin.it/*|*://goo.gl/*|*://tinyurl.com/*|\
+      *://clck.ru/*|*://is.gd/*|*://cutt.ly/*|*://on.soundcloud.com/*|*://redd.it/*|*reddit.com/r/*/s/*)
+        r=$(curl -sL -A "Mozilla/5.0" -o /dev/null -w '%{url_effective}' --max-time 15 "$1" 2>/dev/null)
+        [ -n "$r" ] && { printf '%s' "$r"; return; } ;;
+    esac
+  fi
+  printf '%s' "$1"
+}
+
+# ---------- загрузчики ----------
+YTDLP_BASE=(--no-playlist --windows-filenames --no-mtime --embed-metadata
+            --retries 10 --fragment-retries 10 --concurrent-fragments 4)
+# плейлисты/альбомы попадают в подпапку с их названием, одиночные файлы — прямо в папку сервиса
+out_tmpl() { printf '%s' "$DEST/%(playlist_title|)s/%(title).150B [%(id)s].%(ext)s"; }
+
+ytdlp_video() {  # ytdlp_video <url> <сортировка форматов>
+  ensure_pip yt-dlp yt-dlp || return 1
+  run yt-dlp "${YTDLP_BASE[@]}" "${COOK[@]}" -S "$2" --merge-output-format mp4 \
+      -o "$(out_tmpl)" "$1"
+}
+
+ytdlp_audio() {
+  ensure_pip yt-dlp yt-dlp || return 1
+  run yt-dlp "${YTDLP_BASE[@]}" "${COOK[@]}" -x --audio-format mp3 --audio-quality 0 \
+      --embed-thumbnail --convert-thumbnails jpg -o "$(out_tmpl)" "$1"
+}
+
+gdl() {
+  ensure_pip gallery-dl gallery-dl || return 1
+  run gallery-dl "${COOK[@]}" -D "$DEST" "$1"
+}
+
+video_menu() {
+  local c
+  echo
+  echo "  1) Видео — лучшее качество  (по умолчанию)"
+  echo "  2) Видео — до 1080p"
+  echo "  3) Видео — до 720p (экономит место)"
+  echo "  4) Только звук — MP3"
+  echo "  5) Отмена"
+  if [ "$DRY" = 1 ]; then c="${TUO_CHOICE:-1}"
+  else read -r -n 1 -t "$MENU_TIMEOUT" -p "Выбор [1-5] (через ${MENU_TIMEOUT} с — 1): " c; echo
+  fi
+  case "$c" in
+    2) ytdlp_video "$1" "res:1080,ext:mp4:m4a" ;;
+    3) ytdlp_video "$1" "res:720,ext:mp4:m4a" ;;
+    4) ytdlp_audio "$1" ;;
+    5) warn "Отменено"; return 2 ;;
+    *) ytdlp_video "$1" "res,ext:mp4:m4a" ;;
+  esac
+}
+
+dl_spotify() {
+  if ! command -v spotdl >/dev/null 2>&1 && [ "$DRY" != 1 ]; then
+    err "spotdl не установлен. Установка: curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scripts/termux.sh | sh"
+    return 1
+  fi
+  local tmpl='{artists} - {title}.{output-ext}'
+  case "$1" in
+    */album/*)    tmpl='{album}/{artists} - {title}.{output-ext}' ;;
+    */playlist/*) tmpl='{list-name}/{artists} - {title}.{output-ext}' ;;
+    */artist/*)   tmpl='{album-artist}/{album}/{artists} - {title}.{output-ext}' ;;
+  esac
+  run spotdl download "$1" --output "$DEST/$tmpl" --threads 2 --max-retries 5
+}
+
+dl_direct() {
+  ensure_pkg curl curl || return 1
+  run curl -L --fail --retry 3 -A "Mozilla/5.0" --output-dir "$DEST" -OJ "$1"
+}
+
+dl_git() {
+  local url="$1" repo
+  case "$url" in
+    *raw.githubusercontent.com/*|*/releases/download/*|*/archive/*|*objects.githubusercontent.com/*)
+      dl_direct "$url"; return ;;
+    */blob/*)
+      dl_direct "$(printf '%s' "$url" | sed -E 's#https?://(www\.)?github\.com/([^/]+)/([^/]+)/blob/#https://raw.githubusercontent.com/\2/\3/#')"
+      return ;;
+  esac
+  ensure_pkg git git || return 1
+  repo=$(printf '%s' "$url" | sed -E 's#^https?://(www\.)?github\.com/([^/]+)/([^/?#]+).*#\2/\3#; s#\.git$##')
+  run git clone --depth 1 "https://github.com/$repo.git" "$DEST/${repo//\//_}"
+}
+
+dl_gdrive() {
+  ensure_pip gdown gdown || return 1
+  case "$1" in
+    */folders/*) run gdown --folder "$1" -O "$DEST" ;;
+    *)           run gdown "$1" -O "$DEST/" ;;
+  esac
+}
+
+dl_torrent() {
+  ensure_pkg aria2c aria2 || return 1
+  run aria2c --dir="$DEST" --seed-time=0 --summary-interval=0 --follow-torrent=true "$1"
+}
+
+dl_generic() {
+  ytdlp_video "$1" "res,ext:mp4:m4a" && return 0
+  warn "yt-dlp не справился — пробую gallery-dl…"
+  gdl "$1" && return 0
+  warn "Пробую скачать как обычный файл…"
+  local ct
+  ct=$(curl -sIL -A "Mozilla/5.0" -o /dev/null -w '%{content_type}' --max-time 20 "$1" 2>/dev/null)
+  case "$ct" in
+    text/html*|"") err "По ссылке веб-страница, скачивать нечего."; return 1 ;;
+  esac
+  dl_direct "$1"
+}
+
+# ---------- служебное ----------
+notify() {
+  command -v termux-notification >/dev/null 2>&1 || return 0
+  timeout 10 termux-notification --title "$1" --content "$2" >/dev/null 2>&1
+}
+media_scan() {
+  command -v termux-media-scan >/dev/null 2>&1 || return 0
+  timeout 30 termux-media-scan -r "$DEST" >/dev/null 2>&1
+}
+log_line() { printf '%s | %-13s | %-4s | %s\n' "$(date '+%F %T')" "$SERVICE" "$1" "$2" >> "$LOG" 2>/dev/null; }
+
+hint_on_fail() {
+  case "$SERVICE" in
+    Twitter|Instagram|Threads|Facebook|Pinterest|TikTok|Reddit|Bluesky|Pixiv|DeviantArt)
+      warn "Сервис может требовать вход. Положите cookies в: $COOKIES_DIR/$SLUG.txt" ;;
+    YouTube|"YouTube Music")
+      warn "Попробуйте обновить загрузчики: termux-url-opener --update" ;;
+    Spotify)
+      warn "Запустите ту же ссылку ещё раз — скачанные треки будут пропущены." ;;
+  esac
+}
+
+process_url() {
+  local url rc
+  url=$(printf '%s' "$1" | sed -E 's/[.,;!»"'"'"')]+$//')
+  url=$(resolve_short "$url")
+  detect_service "$url"
+  if [ "$TYPE" != spotify ] && [ "$TYPE" != torrent ]; then
+    case "${url%%[?#]*}" in *.torrent|*.TORRENT) TYPE=torrent ;; esac
+    if [ "$TYPE" != torrent ] && is_direct_file "$url"; then
+      TYPE=direct
+      [ "$SERVICE" = "Other" ] && SERVICE="Files"
+    fi
+  fi
+  [ "$TYPE" = torrent ] && SERVICE="Torrents"
+
+  DEST="$ROOT/$SERVICE"
+  SLUG=$(printf '%s' "$SERVICE" | tr 'A-Z ' 'a-z_')
+  COOK=()
+  local f
+  for f in "$COOKIES_DIR/$SLUG.txt" "$COOKIES_DIR/cookies.txt"; do
+    [ -f "$f" ] && { COOK=(--cookies "$f"); break; }
+  done
+  mkdir -p "$DEST" 2>/dev/null
+
+  echo
+  printf '%s\n' "${c_b}━━━ ${SERVICE} ━━━${c_0}"
+  echo "Ссылка: $url"
+  echo "Папка:  Download/Termux Downloads/$SERVICE"
+  [ ${#COOK[@]} -gt 0 ] && echo "Cookies: ${COOK[1]}"
+
+  case "$TYPE" in
+    spotify) dl_spotify "$url" ;;
+    video)   video_menu "$url" ;;
+    audio)   ytdlp_audio "$url" ;;
+    social)  ytdlp_video "$url" "res,ext:mp4:m4a" || { warn "Пробую gallery-dl…"; gdl "$url"; } ;;
+    gallery) gdl "$url" || { warn "Пробую yt-dlp…"; ytdlp_video "$url" "res,ext:mp4:m4a"; } ;;
+    gdrive)  dl_gdrive "$url" ;;
+    git)     dl_git "$url" ;;
+    torrent) dl_torrent "$url" ;;
+    direct)  dl_direct "$url" ;;
+    *)       dl_generic "$url" ;;
+  esac
+  rc=$?
+
+  if [ $rc -eq 0 ]; then
+    ok "Готово: $SERVICE"; log_line OK "$url"; [ "$DRY" = 1 ] || media_scan
+  elif [ $rc -eq 2 ]; then
+    log_line SKIP "$url"
+  else
+    err "Не удалось скачать: $url"; log_line FAIL "$url"; hint_on_fail
+  fi
+  return $rc
+}
+
+usage() {
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+update_tools() {
+  "$PY" -m pip install -U yt-dlp gallery-dl gdown && ok "yt-dlp, gallery-dl и gdown обновлены."
+  echo "spotDL обновляется отдельно (нужен rust):"
+  echo "  pkg install -y rust binutils && ANDROID_API_LEVEL=\$(getprop ro.build.version.sdk) $PY -m pip install -U spotdl"
+}
+
+# ============================== main ==============================
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+  --update)  update_tools; exit $? ;;
+  "")        usage; exit 1 ;;
+esac
+
+if [ "$DRY" != 1 ] && [ ! -d "$HOME/storage/shared" ]; then
+  say "Нужен доступ к памяти телефона — разрешите его в появившемся окне."
+  termux-setup-storage; sleep 4
+fi
+mkdir -p "$ROOT" "$COOKIES_DIR" 2>/dev/null
+
+# Локальный .torrent-файл (передаётся из termux-file-editor)
+if [ -f "$1" ]; then
+  case "${1,,}" in
+    *.torrent)
+      SERVICE="Torrents"; DEST="$ROOT/$SERVICE"; mkdir -p "$DEST"
+      dl_torrent "$1"; rc=$?; log_line "$([ $rc -eq 0 ] && echo OK || echo FAIL)" "$1"
+      [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
+      exit $rc ;;
+  esac
+fi
+
+INPUT="$*"
+mapfile -t URLS < <(printf '%s\n' "$INPUT" | grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+')
+[ ${#URLS[@]} -eq 0 ] && URLS=("$INPUT")
+
+[ "$DRY" != 1 ] && command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
+
+total=${#URLS[@]}; okc=0; failc=0
+for u in "${URLS[@]}"; do
+  process_url "$u"; case $? in 0) okc=$((okc+1));; 2) ;; *) failc=$((failc+1));; esac
+done
+
+[ "$DRY" != 1 ] && command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
+
+echo
+if [ $failc -eq 0 ]; then
+  ok "Скачано: $okc из $total → Download/Termux Downloads"
+  notify "Загрузка завершена" "$okc из $total → Download/Termux Downloads"
+  [ "$DRY" = 1 ] || read -r -n 1 -s -t 10 -p "Окно закроется через 10 с (или нажмите любую клавишу)…"
+else
+  err "Ошибок: $failc из $total. История: Download/Termux Downloads/.history.log"
+  notify "Загрузка с ошибками" "Ошибок: $failc из $total"
+  [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
+fi
+echo
