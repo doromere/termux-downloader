@@ -1,0 +1,15 @@
+# Загруженные видео и логи
+downloads/
+*.log
+*.log.*
+
+# Кэш Python и виртуальные окружения
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Артефакты сборки
+build/
+dist/
+*.spec
