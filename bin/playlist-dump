@@ -14,8 +14,13 @@ USAGE = """playlist-dump — скачивание и выгрузка плейл
       --name ИМЯ      имя папки/плейлиста (по умолчанию — из файла)
       --numbered      нумеровать файлы по порядку в плейлисте
       --yt-only       не искать в Spotify, качать сразу с YouTube
-      --check         только показать, что найдено в файле
+      --check         только показать, что найдено в файле и что уже скачано
+      --format F      mp3 (по умолчанию) | m4a | opus — m4a/opus без перекодирования, в разы быстрее
+      --threads N     сколько треков качать одновременно (по умолчанию 4)
+      --no-lyrics     не искать тексты песен (быстрее)
       -y, --yes       не спрашивать подтверждение
+
+Уже скачанные треки проверяются в первую очередь и пропускаются без обращения к сети.
 
 Выгрузить плейлист/альбом Spotify в CSV и TXT (как TuneMyMusic):
   playlist-dump export ССЫЛКА [ССЫЛКА…] [--format csv|txt|both]
@@ -295,8 +300,46 @@ class Spotify:
         return None
 
 
+def song_from_item(item):
+    """Полные метаданные трека для spotDL из ответа Spotify (поиск или track()).
+
+    Если передать их spotDL, он не делает reinit_song — а это 3 запроса к Spotify
+    на КАЖДЫЙ трек (track + artist + album), главная причина медленной загрузки.
+    None — если данных не хватает (тогда spotDL догрузит их сам).
+    """
+    try:
+        alb = item.get("album") or {}
+        artists = [a.get("name") for a in item.get("artists") or [] if isinstance(a, dict) and a.get("name")]
+        sid = item_id(item)
+        dur = int((item.get("duration_ms") or 0) / 1000)
+        date = alb.get("release_date") or ""
+        if not (isinstance(alb, dict) and alb.get("id") and artists and item.get("name") and sid and dur > 0
+                and re.match(r"^[12]\d{3}", date)):
+            return None
+        imgs = [i for i in alb.get("images") or [] if isinstance(i, dict) and i.get("url")]
+        cover_url = max(imgs, key=lambda i: (i.get("width") or 0) * (i.get("height") or 0))["url"] if imgs else None
+        alb_artists = [a.get("name") for a in alb.get("artists") or [] if isinstance(a, dict) and a.get("name")]
+        tn = int(item.get("track_number") or 1)
+        dn = int(item.get("disc_number") or 1)
+        return {
+            "name": item["name"], "artists": artists, "artist": artists[0],
+            "artist_id": (item["artists"][0] or {}).get("id") or None,
+            "genres": [], "disc_number": dn, "disc_count": dn,
+            "album_name": alb.get("name") or "", "album_artist": (alb_artists or artists)[0],
+            "album_id": alb["id"], "album_type": alb.get("album_type"),
+            "duration": dur, "year": int(date[:4]), "date": date,
+            "track_number": tn, "tracks_count": max(int(alb.get("total_tracks") or 0), tn),
+            "song_id": sid, "explicit": bool(item.get("explicit")), "publisher": "",
+            "url": f"https://open.spotify.com/track/{sid}",
+            "isrc": (item.get("external_ids") or {}).get("isrc") or None,
+            "cover_url": cover_url, "copyright_text": None, "popularity": item.get("popularity"),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def resolve(rows, sp: Spotify, cache: dict, save_cache):
-    """Возвращает {key: spotify_id | ''}. '' — не найдено в Spotify."""
+    """Ищет треки без Spotify ID: cache[key] = spotify_id | '' ('' — нет в Spotify)."""
     # '' (не найдено) ищем заново: это могла быть временная ошибка/лимит Spotify
     todo = [r for r in rows if not r["sid"] and not cache.get(row_key(r))]
     if not todo or not sp.client:
@@ -313,6 +356,10 @@ def resolve(rows, sp: Spotify, cache: dict, save_cache):
             s = score(item, row)
             if s > best_score:
                 best, best_score = item, s
+        if best:
+            meta = song_from_item(best)
+            if meta:
+                cache.setdefault("meta", {})[item_id(best)] = meta
         return row, (item_id(best) if best else "")
 
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -328,6 +375,97 @@ def resolve(rows, sp: Spotify, cache: dict, save_cache):
             if done % 25 == 0:
                 save_cache()
     save_cache()
+
+
+def fetch_meta(sids, sp: Spotify, cache: dict, save_cache):
+    """Метаданные для треков, у которых есть только Spotify ID: 1 запрос вместо 3 у spotDL,
+    параллельно и с сохранением в кэш (при повторном запуске — ни одного запроса)."""
+    meta = cache.setdefault("meta", {})
+    todo = [s for s in dict.fromkeys(sids) if s and s not in meta]
+    if not todo or not sp or not sp.client or not hasattr(sp.client, "track"):
+        return
+    say(f"Получаю данные о {len(todo)} трек(ах) из Spotify…")
+    done = 0
+
+    def work(sid):
+        for attempt in range(3):
+            try:
+                return sid, song_from_item(sp.client.track(sid))
+            except Exception:  # noqa: BLE001
+                time.sleep(3 * (attempt + 1))
+        return sid, None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for sid, m in ex.map(work, todo):
+            done += 1
+            if m:
+                meta[sid] = m
+            if done % 25 == 0 or done == len(todo):
+                print(f"  {done}/{len(todo)}", flush=True)
+                save_cache()
+
+
+# --------------------------------------------------------------------------
+# Проверка уже скачанного
+# --------------------------------------------------------------------------
+AUDIO_EXT = {".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac", ".webm"}
+NUM_PREFIX = re.compile(r"^\d{1,4}\s*-\s+")
+FEAT_RE = re.compile(r"\s*[(\[](?:feat|ft|with)\b[^)\]]*[)\]]", re.I)
+DASH_RE = re.compile(r"\s[-–—]\s")
+
+
+def title_sig(title):
+    return frozenset(tokens(FEAT_RE.sub(" ", title or "")))
+
+
+def first_artist(artists):
+    return tokens(re.split(r"[,;&]", artists or "")[0])
+
+
+def row_sig(row, cache):
+    """(подпись названия, токены первого исполнителя) — для сравнения с именами файлов."""
+    sid = row["sid"] or cache.get(row_key(row))
+    m = (cache.get("meta") or {}).get(sid) if sid else None
+    if row["title"]:
+        return title_sig(row["title"]), first_artist(row["artist"])
+    if row["query"]:
+        parts = DASH_RE.split(row["query"], maxsplit=1)
+        if len(parts) == 2:
+            return title_sig(parts[1]), first_artist(parts[0])
+        return title_sig(row["query"]), set()
+    if m:
+        return title_sig(m["name"]), first_artist(m["artist"])
+    return None
+
+
+class Existing:
+    """Аудиофайлы в папке плейлиста: один проход по папке, поиск за O(1)."""
+
+    def __init__(self, dest: Path):
+        self.names, self.index = set(), {}
+        try:
+            files = [p for p in dest.iterdir() if p.suffix.lower() in AUDIO_EXT and p.is_file()]
+        except OSError:
+            files = []
+        for p in files:
+            self.names.add(p.name)
+            parts = DASH_RE.split(NUM_PREFIX.sub("", p.stem), maxsplit=1)
+            artist, title = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
+            self.index.setdefault(title_sig(title), []).append((tokens(artist), p.name))
+
+    def find(self, row, cache):
+        known = (cache.get("files") or {}).get(row_key(row))
+        if known and known in self.names:
+            return known
+        sig = row_sig(row, cache)
+        if not sig or not sig[0]:
+            return None
+        t, a = sig
+        for file_artists, name in self.index.get(t, []):
+            # название совпадает полностью (ремикс/live — другое название), исполнитель — входит
+            if not a or not file_artists or a <= file_artists or cover(a, file_artists) >= 0.5:
+                return name
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -353,68 +491,96 @@ def spotdl_cmd():
     return [exe] if exe else [sys.executable, "-m", "spotdl"]
 
 
-def run_spotdl(entries, dest: Path, name: str, numbered: bool, dry: bool):
+def run_spotdl(entries, dest: Path, opts, dry: bool):
     spotdl_file = dest / ".playlist.spotdl"
     spotdl_file.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
-    tmpl = "{list-position} - {artists} - {title}.{output-ext}" if numbered else "{artists} - {title}.{output-ext}"
-    cmd = spotdl_cmd() + ["download", str(spotdl_file), "--output", tmpl, "--threads", "2",
-                          "--save-errors", ".spotdl-errors.txt", "--m3u", f"{safe_name(name)}.m3u8"]
+    tmpl = "{list-position} - {artists} - {title}.{output-ext}" if opts.numbered else "{artists} - {title}.{output-ext}"
+    cmd = spotdl_cmd() + ["download", str(spotdl_file), "--output", tmpl,
+                          "--threads", str(opts.threads), "--format", opts.format,
+                          "--save-errors", ".spotdl-errors.txt"]
+    if opts.format in ("m4a", "opus"):
+        cmd += ["--bitrate", "disable"]  # без перекодирования: файл YouTube просто копируется
+    if opts.no_lyrics:
+        cmd += ["--lyrics"]  # пустой список = не искать тексты
     js = js_runtime_args()
     if js:
         cmd += ["--yt-dlp-args", " ".join(js)]
-    say(f"spotDL: скачиваю {len(entries)} трек(ов)…")
+    full = sum(1 for e in entries if e.get("name"))
+    say(f"spotDL: скачиваю {len(entries)} трек(ов), до {min(opts.threads, len(entries))} одновременно…")
+    if full < len(entries):
+        print(f"  (для {len(entries) - full} трек(ов) spotDL сам догрузит данные из Spotify — это дольше)")
     if dry:
         print("[dry-run]", " ".join(cmd))
         return 0
     return subprocess.call(cmd, cwd=str(dest))
 
 
-def run_youtube(rows, dest: Path, name: str, dry: bool):
+def run_youtube(rows, dest: Path, opts, dry: bool):
+    """Запасной вариант: поиск на YouTube, несколько треков параллельно.
+    Возвращает {row_key: имя файла} для скачанных."""
     if not rows:
-        return []
+        return {}
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp and not dry:
         say("Устанавливаю yt-dlp…")
         subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default]"])
         ytdlp = shutil.which("yt-dlp")
     cmd_base = ([ytdlp] if ytdlp else [sys.executable, "-m", "yt_dlp"]) + js_runtime_args()
-    say(f"YouTube: скачиваю {len(rows)} трек(ов), которых нет в Spotify…")
-    files, failed = [], []
-    for i, row in enumerate(rows, 1):
+    fmt = opts.format
+    if fmt == "m4a":
+        audio = ["-f", "bestaudio[ext=m4a]/bestaudio/best", "-x", "--audio-format", "m4a"]
+    elif fmt == "opus":
+        audio = ["-f", "bestaudio[acodec=opus]/bestaudio/best", "-x", "--audio-format", "opus"]
+    else:
+        audio = ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+    workers = max(1, min(opts.threads, 4, len(rows)))
+    say(f"YouTube: скачиваю {len(rows)} трек(ов), которых нет в Spotify, {workers} одновременно…")
+    total, done, got, failed = len(rows), 0, {}, []
+
+    def work(row):
         label = row_label(row)
         base = safe_name(label, 150)
-        target = dest / f"{base}.mp3"
-        files.append(target.name)
+        target = dest / f"{base}.{fmt}"
         if target.exists():
-            print(f"  [{i}/{len(rows)}] уже есть: {target.name}")
-            continue
-        print(f"  [{i}/{len(rows)}] {label}", flush=True)
+            return row, label, target.name
         # из 3 результатов берём первый не длиннее 15 минут и не стрим —
         # чтобы не скачать часовой микс или трансляцию вместо трека
-        cmd = cmd_base + ["-q", "--no-warnings", "--progress", "--no-playlist", "-x",
-                          "--audio-format", "mp3", "--audio-quality", "0",
+        cmd = cmd_base + ["-q", "--no-warnings", "--no-progress", "--no-playlist", *audio,
                           "--embed-thumbnail", "--embed-metadata", "--windows-filenames",
                           "--match-filter", "duration<=?900 & !is_live", "--max-downloads", "1",
                           "-o", str(dest / f"{base}.%(ext)s"), f"ytsearch3:{label}"]
         if dry:
             print("[dry-run]", " ".join(cmd))
-            continue
-        subprocess.call(cmd)  # код 101 = «достигнут --max-downloads», это успех
-        if not target.exists():
-            failed.append(label)
+            return row, label, None
+        subprocess.call(cmd, stdout=subprocess.DEVNULL)  # код 101 = «достигнут --max-downloads», это успех
+        return row, label, (target.name if target.exists() else None)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for row, label, fname in ex.map(work, rows):
+            done += 1
+            if fname:
+                got[row_key(row)] = fname
+                print(f"  [{done}/{total}] {C_OK}✔{C_0} {label}", flush=True)
+            elif not dry:
+                failed.append(label)
+                print(f"  [{done}/{total}] {C_ERR}✘{C_0} {label}", flush=True)
     if failed:
         with open(dest / ".not-found.txt", "a", encoding="utf-8") as f:
             f.write("\n".join(failed) + "\n")
         warn(f"Не скачано: {len(failed)} (список: {dest.name}/.not-found.txt)")
-    return files
+    return got
 
 
-def entry_for(sid, name, pos, total, fields):
+def entry_for(sid, name, pos, total, fields, meta=None, isrc=None):
     fields = fields or [
         "name", "artists", "artist", "genres", "disc_number", "disc_count", "album_name",
         "album_artist", "duration", "year", "date", "track_number", "tracks_count", "song_id",
         "explicit", "publisher", "url", "isrc", "cover_url", "copyright_text"]
     e = {f: None for f in fields}
+    if meta:
+        e.update({k: v for k, v in meta.items() if k in e})
+        if isrc and not e.get("isrc"):
+            e["isrc"] = isrc  # ISRC из дампа помогает spotDL найти точную запись
     e.update({"url": f"https://open.spotify.com/track/{sid}", "song_id": sid,
               "list_name": name, "list_position": pos, "list_length": total})
     return {k: v for k, v in e.items() if k in fields or k.startswith("list_")}
@@ -457,6 +623,63 @@ def pick_file():
     return [files[int(a) - 1] for a in ans if a.isdigit() and 0 < int(a) <= len(files)]
 
 
+def load_cache(dest: Path):
+    cache_file = dest / CACHE_NAME
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:  # noqa: BLE001
+        cache = {}
+
+    def save_cache():
+        try:
+            tmp = cache_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(cache_file)
+        except OSError:
+            pass
+    return cache, save_cache
+
+
+def write_m3u(dest: Path, name: str, grows, cache):
+    """Плейлист в порядке дампа — из всех скачанных треков, а не только из новых."""
+    files = cache.get("files") or {}
+    lines, seen = ["#EXTM3U"], set()
+    for r in grows:
+        f = files.get(row_key(r))
+        if f and f not in seen and (dest / f).exists():
+            seen.add(f)
+            lines.append(f)
+    if len(lines) > 1:
+        (dest / f"{safe_name(name)}.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class Group:
+    """Плейлист из дампа + что из него уже лежит в папке."""
+
+    def __init__(self, name, rows):
+        self.name, self.rows = name, rows
+        self.dest = ROOT / "Spotify" / safe_name(name)
+        self.cache, self.save_cache = load_cache(self.dest)
+        self.refresh()
+
+    def refresh(self):
+        """Сверка дампа с папкой — без единого сетевого запроса."""
+        ex = Existing(self.dest)
+        files = self.cache.setdefault("files", {})
+        self.missing, seen, self.have = [], set(), 0
+        for r in self.rows:
+            key = row_key(r)
+            f = ex.find(r, self.cache)
+            if f:
+                files[key] = f
+                self.have += 1
+            elif key not in seen:  # дубли в дампе качаем один раз
+                seen.add(key)
+                self.missing.append(r)
+
+
 def download(paths, args):
     sp = None
     for path in paths:
@@ -467,27 +690,48 @@ def download(paths, args):
         if not rows:
             err(f"В файле не найдено треков: {path.name}")
             continue
-        groups = {}
+        grouped = {}
         for r in rows:
-            groups.setdefault(args.name or r["playlist"] or path.stem, []).append(r)
+            grouped.setdefault(args.name or r["playlist"] or path.stem, []).append(r)
 
         with_id = sum(1 for r in rows if r["sid"])
         print(f"\n{C_B}━━━ {path.name} ({kind.upper()}) ━━━{C_0}")
-        print(f"Треков: {len(rows)}  (со Spotify ID: {with_id})  плейлистов: {len(groups)}")
+        print(f"Треков: {len(rows)}  (со Spotify ID: {with_id})  плейлистов: {len(grouped)}")
         for r in rows[:5]:
             print(f"   • {row_label(r)}")
         if len(rows) > 5:
             print(f"   … и ещё {len(rows) - 5}")
+
+        # 1. В первую очередь — что уже скачано (только локальная проверка)
+        groups = [Group(n, g) for n, g in grouped.items()]
+        todo = sum(len(g.missing) for g in groups)
+        have = sum(g.have for g in groups)
+        if have:
+            ok(f"Уже скачано: {have} из {len(rows)}")
         if args.check:
+            for g in groups:
+                if g.missing and len(groups) > 1:
+                    print(f"   {g.name}: не хватает {len(g.missing)}")
+            if todo:
+                print(f"Осталось скачать: {todo}")
             continue
+        if not todo:
+            for g in groups:
+                if not args.dry_run:
+                    write_m3u(g.dest, g.name, g.rows, g.cache)
+                    g.save_cache()
+            ok("Все треки уже скачаны — нечего делать.")
+            continue
+
         default_yes = True
         if kind == "txt":
-            liked = sum(1 for r in rows if r["sid"] or re.search(r"\s[-–—]\s", r["query"] or ""))
+            liked = sum(1 for r in rows if r["sid"] or DASH_RE.search(r["query"] or ""))
             if liked < len(rows) / 2:
                 warn("Похоже, это не список треков (мало строк вида «Исполнитель - Название»).")
                 default_yes = False
         hint = "[Y/n]" if default_yes else "[y/N]"
-        if not args.yes and not ask(f"Скачать {len(rows)} трек(ов)? {hint} ", default=default_yes):
+        what = f"{todo} новых трек(ов)" if have else f"{todo} трек(ов)"
+        if not args.yes and not ask(f"Скачать {what}? {hint} ", default=default_yes):
             warn("Отменено")
             continue
 
@@ -495,30 +739,32 @@ def download(paths, args):
             sp = Spotify()
         wake(True)
         try:
-            for name, grows in groups.items():
-                dest = ROOT / "Spotify" / safe_name(name)
+            for g in groups:
+                if not g.missing:
+                    continue
+                dest, cache, save_cache = g.dest, g.cache, g.save_cache
                 dest.mkdir(parents=True, exist_ok=True)
-                print(f"\n{C_B}▶ {name}{C_0}  →  Download/Termux Downloads/Spotify/{dest.name}/")
-                cache_file = dest / CACHE_NAME
-                try:
-                    cache = json.loads(cache_file.read_text(encoding="utf-8"))
-                except Exception:  # noqa: BLE001
-                    cache = {}
+                print(f"\n{C_B}▶ {g.name}{C_0}  →  Download/Termux Downloads/Spotify/{dest.name}/"
+                      f"  ({len(g.missing)} из {len(g.rows)})")
 
-                def save_cache(cache=cache, cache_file=cache_file):
-                    try:
-                        cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-                    except OSError:
-                        pass
+                # 2. Сеть — только для недостающих треков
+                spotify_ok = bool(sp and sp.client) and not args.yt_only
+                if spotify_ok:
+                    resolve(g.missing, sp, cache, save_cache)
+                    fetch_meta([r["sid"] or cache.get(row_key(r)) for r in g.missing], sp, cache, save_cache)
+                    # после получения названий по ID могли найтись уже скачанные файлы
+                    g.refresh()
 
-                if not args.yt_only:
-                    resolve(grows, sp, cache, save_cache)
-
+                positions = {}
+                for pos, r in enumerate(g.rows, 1):
+                    positions.setdefault(row_key(r), pos)
+                meta = cache.get("meta") or {}
                 entries, yt_rows, no_meta = [], [], []
-                for pos, r in enumerate(grows, 1):
-                    sid = r["sid"] or (cache.get(row_key(r)) if not args.yt_only else None)
-                    if sid and sp and sp.client:
-                        entries.append(entry_for(sid, name, pos, len(grows), sp.song_fields))
+                for r in g.missing:
+                    sid = r["sid"] or (cache.get(row_key(r)) if spotify_ok else None)
+                    if sid and spotify_ok:
+                        entries.append(entry_for(sid, g.name, positions[row_key(r)], len(g.rows),
+                                                 sp.song_fields, meta.get(sid), r["isrc"] or None))
                     elif r["sid"] and not r["title"] and not r["query"]:
                         no_meta.append(f"https://open.spotify.com/track/{r['sid']}")
                     else:
@@ -533,17 +779,18 @@ def download(paths, args):
                         with open(dest / ".not-found.txt", "a", encoding="utf-8") as f:
                             f.write("\n".join(no_meta) + "\n")
                 if entries:
-                    run_spotdl(entries, dest, name, args.numbered, args.dry_run)
-                yt_files = run_youtube(yt_rows, dest, name, args.dry_run)
+                    run_spotdl(entries, dest, args, args.dry_run)
+                got = run_youtube(yt_rows, dest, args, args.dry_run)
 
-                m3u = dest / f"{safe_name(name)}.m3u8"
-                if yt_files and not args.dry_run:
-                    existing = m3u.read_text(encoding="utf-8").splitlines() if m3u.exists() else ["#EXTM3U"]
-                    for f in yt_files:
-                        if (dest / f).exists() and f not in existing:
-                            existing.append(f)
-                    m3u.write_text("\n".join(existing) + "\n", encoding="utf-8")
-                ok(f"Готово: {name}")
+                if not args.dry_run:
+                    cache.setdefault("files", {}).update(got)
+                    g.refresh()  # запомнить, какой файл соответствует какой строке дампа
+                    write_m3u(dest, g.name, g.rows, cache)
+                    save_cache()
+                    if g.missing:
+                        warn(f"{g.name}: не скачано {len(g.missing)} — запустите ещё раз, "
+                             "скачанное будет пропущено.")
+                ok(f"Готово: {g.name}")
         finally:
             wake(False)
 
@@ -623,8 +870,12 @@ def main():
     p.add_argument("--check", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--keep-dump", action="store_true")
+    p.add_argument("--format", choices=["mp3", "m4a", "opus"], default="mp3")
+    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--no-lyrics", action="store_true")
     p.add_argument("-y", "--yes", action="store_true")
     args = p.parse_args(argv)
+    args.threads = max(1, min(args.threads, 8))
     files = args.files or pick_file()
     if not files:
         return 1
