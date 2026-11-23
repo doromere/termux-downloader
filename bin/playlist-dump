@@ -1,0 +1,602 @@
+#!/data/data/com.termux/files/usr/bin/sh
+''':'
+for p in python3.13 python3 python; do
+  command -v "$p" >/dev/null 2>&1 && exec "$p" "$0" "$@"
+done
+echo "Python не найден: pkg install python" >&2
+exit 1
+'''
+USAGE = """playlist-dump — скачивание и выгрузка плейлистов (дампы CSV/TXT).
+
+Скачать треки из дампа (TuneMyMusic, Exportify, свой список «Исполнитель - Название»):
+  playlist-dump                       выбрать .csv/.txt из папки Download
+  playlist-dump файл.csv [файл.txt…]  скачать
+      --name ИМЯ      имя папки/плейлиста (по умолчанию — из файла)
+      --numbered      нумеровать файлы по порядку в плейлисте
+      --yt-only       не искать в Spotify, качать сразу с YouTube
+      --check         только показать, что найдено в файле
+      -y, --yes       не спрашивать подтверждение
+
+Выгрузить плейлист/альбом Spotify в CSV и TXT (как TuneMyMusic):
+  playlist-dump export ССЫЛКА [ССЫЛКА…] [--format csv|txt|both]
+
+Файлы: Download/Termux Downloads/Spotify/<плейлист>/  (+ <плейлист>.m3u8)
+Выгрузки: Download/Termux Downloads/Playlists/
+"""
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = Path(os.environ.get("TUO_ROOT", HOME / "storage/shared/Download/Termux Downloads"))
+SEARCH_DIRS = [
+    HOME / "storage/shared/Download",
+    HOME / "storage/shared/Documents",
+    ROOT / "Shared Files",
+    ROOT / "Playlists",
+    HOME / "downloads",
+]
+CACHE_NAME = ".playlist-dump.json"
+
+C_OK, C_ERR, C_INF, C_WARN, C_B, C_0 = "\033[32m", "\033[31m", "\033[36m", "\033[33m", "\033[1m", "\033[0m"
+
+
+def say(msg):
+    print(f"{C_INF}{msg}{C_0}", flush=True)
+
+
+def ok(msg):
+    print(f"{C_OK}✔ {msg}{C_0}", flush=True)
+
+
+def warn(msg):
+    print(f"{C_WARN}! {msg}{C_0}", flush=True)
+
+
+def err(msg):
+    print(f"{C_ERR}✘ {msg}{C_0}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Разбор дампов
+# --------------------------------------------------------------------------
+HEADER_MAP = {
+    "title": ["track name", "track", "title", "name", "song", "song name", "track title",
+              "название", "трек", "песня", "название трека"],
+    "artist": ["artist name", "artist name(s)", "artist", "artists", "artist(s)", "artist names",
+               "исполнитель", "исполнители", "артист"],
+    "album": ["album", "album name", "album title", "альбом"],
+    "isrc": ["isrc"],
+    "spotify": ["spotify - id", "spotify id", "spotify_id", "track uri", "spotify uri", "uri",
+                "spotify url", "url", "link", "spotify link", "track url", "track id"],
+    "playlist": ["playlist name", "playlist", "плейлист"],
+}
+SPOTIFY_ID_RE = re.compile(
+    r"(?:open\.spotify\.com/(?:intl-[\w-]+/)?track/|spotify:track:)([A-Za-z0-9]{22})")
+BARE_ID_RE = re.compile(r"^[A-Za-z0-9]{22}$")
+
+
+def read_text(path: Path) -> str:
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "utf-16", "cp1251", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            if enc == "utf-16" and not raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                continue
+            return text
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def spotify_id(value: str):
+    if not value:
+        return None
+    value = value.strip()
+    m = SPOTIFY_ID_RE.search(value)
+    if m:
+        return m.group(1)
+    if BARE_ID_RE.match(value):
+        return value
+    return None
+
+
+def norm_header(h: str) -> str:
+    return re.sub(r"\s+", " ", (h or "").strip().strip('"').lower().lstrip("\ufeff"))
+
+
+def map_header(header):
+    mapping = {}
+    for idx, h in enumerate(header):
+        nh = norm_header(h)
+        for field, names in HEADER_MAP.items():
+            if field not in mapping and nh in names:
+                mapping[field] = idx
+    return mapping
+
+
+def try_csv(text: str):
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    sample = "\n".join(lines[:20])
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        return None
+    rows = list(csv.reader(io.StringIO(text), dialect))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return None
+    mapping = map_header(rows[0])
+    if "title" not in mapping and "spotify" not in mapping:
+        return None
+    result = []
+    for r in rows[1:]:
+        def col(field):
+            i = mapping.get(field)
+            return r[i].strip() if i is not None and i < len(r) else ""
+        row = {
+            "title": col("title"), "artist": col("artist"), "album": col("album"),
+            "isrc": col("isrc"), "sid": spotify_id(col("spotify")),
+            "playlist": col("playlist"), "query": "",
+        }
+        if not row["sid"]:
+            # иногда ссылка/URI лежит в другой колонке
+            for cell in r:
+                sid = spotify_id(cell) if "spotify" in cell else None
+                if sid:
+                    row["sid"] = sid
+                    break
+        if row["title"] or row["sid"]:
+            result.append(row)
+    return result
+
+
+def parse_txt(text: str):
+    result = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"^\d{1,4}[.)]\s+", "", line)  # «1. Artist - Title»
+        sid = spotify_id(line)
+        if sid:
+            result.append({"title": "", "artist": "", "album": "", "isrc": "", "sid": sid,
+                           "playlist": "", "query": ""})
+        elif re.match(r"^[a-z]+://", line):
+            continue  # чужие ссылки не трогаем
+        else:
+            result.append({"title": "", "artist": "", "album": "", "isrc": "", "sid": None,
+                           "playlist": "", "query": line})
+    return result
+
+
+def parse_dump(path: Path):
+    text = read_text(path)
+    rows = try_csv(text)
+    kind = "csv"
+    if rows is None:
+        rows = parse_txt(text)
+        kind = "txt"
+    return rows, kind
+
+
+def row_label(row):
+    if row["title"]:
+        return f"{row['artist']} - {row['title']}" if row["artist"] else row["title"]
+    if row["query"]:
+        return row["query"]
+    return f"spotify:track:{row['sid']}"
+
+
+def row_key(row):
+    if row["sid"]:
+        return "id:" + row["sid"]
+    return "q:" + " ".join(sorted(tokens(row_label(row))))
+
+
+# --------------------------------------------------------------------------
+# Сопоставление с Spotify
+# --------------------------------------------------------------------------
+STOP = {"feat", "ft", "featuring", "with", "remastered", "remaster", "version", "the", "a",
+        "and", "x", "vs", "prod", "official", "audio", "video", "lyrics"}
+
+
+def tokens(s: str, drop_paren=False):
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.replace("ё", "е")
+    if drop_paren:
+        s = re.sub(r"[(\[].*?[)\]]", " ", s)
+        s = re.split(r"\s[-–—]\s", s)[0]
+    return {t for t in re.findall(r"\w+", s) if t not in STOP}
+
+
+def cover(a, b):
+    """Доля токенов a, найденных в b."""
+    return len(a & b) / len(a) if a else 0.0
+
+
+def score(item, row):
+    name = item.get("name") or ""
+    artists = " ".join(a.get("name", "") for a in item.get("artists") or [] if isinstance(a, dict))
+    cand_t, cand_t_full, cand_a = tokens(name, True), tokens(name), tokens(artists)
+    if row["title"]:
+        rt, rt_full = tokens(row["title"], True), tokens(row["title"])
+        t = max(cover(rt, cand_t_full), cover(cand_t, rt_full))
+        if row["artist"]:
+            ra = tokens(row["artist"])
+            a = max(cover(ra, cand_a), cover(cand_a, ra))
+            return (t + a) / 2 if t >= 0.6 and a >= 0.5 else 0.0
+        return t if t >= 0.75 else 0.0
+    q = tokens(row["query"])
+    t = cover(cand_t, q)
+    first_artist = tokens((item.get("artists") or [{}])[0].get("name", "")) if item.get("artists") else set()
+    a = cover(first_artist, q) if first_artist else 0.0
+    return (t + a) / 2 if t >= 0.7 and a >= 0.5 else 0.0
+
+
+def build_query(row):
+    if row["title"]:
+        title = re.sub(r"\s*[(\[](feat|ft|with)[^)\]]*[)\]]", "", row["title"], flags=re.I)
+        artist = re.split(r"[,;&]", row["artist"])[0] if row["artist"] else ""
+        return f"{artist} {title}".strip()
+    return re.sub(r"\s[-–—]\s", " ", row["query"])
+
+
+def item_id(item):
+    return item.get("id") or item.get("track_id") or spotify_id(item.get("uri", "") or "")
+
+
+class Spotify:
+    def __init__(self):
+        self.client = None
+        self.song_fields = None
+        try:
+            from spotdl.utils.spotify import SpotifyClient  # type: ignore
+            from spotdl.utils.config import SPOTIFY_OPTIONS  # type: ignore
+            try:
+                from spotdl.types.song import Song  # type: ignore
+                self.song_fields = list(Song.__dataclass_fields__)  # pylint: disable=no-member
+            except Exception:  # noqa: BLE001
+                pass
+            SpotifyClient.init(client_id=SPOTIFY_OPTIONS["client_id"],
+                               client_secret=SPOTIFY_OPTIONS["client_secret"])
+            self.client = SpotifyClient()
+        except ImportError:
+            warn("spotDL не найден — все треки будут скачаны с YouTube.")
+        except Exception as e:  # noqa: BLE001
+            warn(f"Не удалось подключиться к Spotify ({e}) — качаю с YouTube.")
+
+    def search(self, query):
+        if not self.client:
+            return None
+        for attempt in range(4):
+            try:
+                res = self.client.search(query, type="track")
+                return ((res or {}).get("tracks") or {}).get("items") or []
+            except Exception as e:  # noqa: BLE001
+                wait = 5 * (attempt + 1) ** 2
+                if attempt < 3:
+                    warn(f"Spotify: {str(e)[:80]} — повтор через {wait} с")
+                    time.sleep(wait)
+        return None
+
+
+def resolve(rows, sp: Spotify, cache: dict, save_cache):
+    """Возвращает {key: spotify_id | ''}. '' — не найдено в Spotify."""
+    todo = [r for r in rows if not r["sid"] and row_key(r) not in cache]
+    if not todo or not sp.client:
+        return
+    say(f"Ищу в Spotify {len(todo)} трек(ов)…")
+    done = 0
+
+    def work(row):
+        items = sp.search(build_query(row))
+        if items is None:
+            return row, None
+        best, best_score = None, 0.0
+        for item in items[:8]:
+            s = score(item, row)
+            if s > best_score:
+                best, best_score = item, s
+        return row, (item_id(best) if best else "")
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for row, sid in ex.map(work, todo):
+            done += 1
+            label = row_label(row)
+            if sid is None:
+                print(f"  [{done}/{len(todo)}] {C_WARN}? ошибка поиска{C_0} {label}", flush=True)
+                continue
+            cache[row_key(row)] = sid
+            mark = f"{C_OK}✔{C_0}" if sid else f"{C_WARN}→ YouTube{C_0}"
+            print(f"  [{done}/{len(todo)}] {mark} {label}", flush=True)
+            if done % 25 == 0:
+                save_cache()
+    save_cache()
+
+
+# --------------------------------------------------------------------------
+# Загрузка
+# --------------------------------------------------------------------------
+def safe_name(s: str, limit=120) -> str:
+    s = re.sub(r'[\\/:*?"<>|{}\x00-\x1f]', "_", s).strip(" .")
+    return (s or "playlist")[:limit]
+
+
+def spotdl_cmd():
+    exe = shutil.which("spotdl")
+    return [exe] if exe else [sys.executable, "-m", "spotdl"]
+
+
+def run_spotdl(entries, dest: Path, name: str, numbered: bool, dry: bool):
+    spotdl_file = dest / ".playlist.spotdl"
+    spotdl_file.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+    tmpl = "{list-position} - {artists} - {title}.{output-ext}" if numbered else "{artists} - {title}.{output-ext}"
+    cmd = spotdl_cmd() + ["download", str(spotdl_file), "--output", tmpl, "--threads", "2",
+                          "--save-errors", ".spotdl-errors.txt", "--m3u", f"{safe_name(name)}.m3u8"]
+    say(f"spotDL: скачиваю {len(entries)} трек(ов)…")
+    if dry:
+        print("[dry-run]", " ".join(cmd))
+        return 0
+    return subprocess.call(cmd, cwd=str(dest))
+
+
+def run_youtube(rows, dest: Path, name: str, dry: bool):
+    if not rows:
+        return []
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp and not dry:
+        say("Устанавливаю yt-dlp…")
+        subprocess.call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"])
+        ytdlp = shutil.which("yt-dlp")
+    cmd_base = [ytdlp or "yt-dlp"] if ytdlp else [sys.executable, "-m", "yt_dlp"]
+    say(f"YouTube: скачиваю {len(rows)} трек(ов), которых нет в Spotify…")
+    files, failed = [], []
+    for i, row in enumerate(rows, 1):
+        label = row_label(row)
+        base = safe_name(label, 150)
+        target = dest / f"{base}.mp3"
+        files.append(target.name)
+        if target.exists():
+            print(f"  [{i}/{len(rows)}] уже есть: {target.name}")
+            continue
+        print(f"  [{i}/{len(rows)}] {label}", flush=True)
+        cmd = cmd_base + ["-q", "--no-warnings", "--progress", "--no-playlist", "-x",
+                          "--audio-format", "mp3", "--audio-quality", "0",
+                          "--embed-thumbnail", "--embed-metadata", "--windows-filenames",
+                          "-o", str(dest / f"{base}.%(ext)s"), f"ytsearch1:{label}"]
+        if dry:
+            print("[dry-run]", " ".join(cmd))
+            continue
+        if subprocess.call(cmd) != 0:
+            failed.append(label)
+    if failed:
+        (dest / ".not-found.txt").write_text("\n".join(failed) + "\n", encoding="utf-8")
+        warn(f"Не скачано: {len(failed)} (список: {dest.name}/.not-found.txt)")
+    return files
+
+
+def entry_for(sid, name, pos, total, fields):
+    fields = fields or [
+        "name", "artists", "artist", "genres", "disc_number", "disc_count", "album_name",
+        "album_artist", "duration", "year", "date", "track_number", "tracks_count", "song_id",
+        "explicit", "publisher", "url", "isrc", "cover_url", "copyright_text"]
+    e = {f: None for f in fields}
+    e.update({"url": f"https://open.spotify.com/track/{sid}", "song_id": sid,
+              "list_name": name, "list_position": pos, "list_length": total})
+    return {k: v for k, v in e.items() if k in fields or k.startswith("list_")}
+
+
+def wake(lock: bool):
+    exe = shutil.which("termux-wake-lock" if lock else "termux-wake-unlock")
+    if exe:
+        subprocess.call([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def ask(prompt, default=True, timeout=None):
+    if not sys.stdin.isatty():
+        return default
+    try:
+        ans = input(prompt).strip().lower()
+    except EOFError:
+        return default
+    if not ans:
+        return default
+    return ans[0] in ("y", "д", "1")
+
+
+def pick_file():
+    files = []
+    for d in SEARCH_DIRS:
+        if d.is_dir():
+            files += [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in (".csv", ".txt")]
+    files = sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    if not files:
+        err("Не нашёл .csv/.txt в Download. Укажите путь: playlist-dump /путь/к/файлу.csv")
+        return []
+    print(f"{C_B}Файлы плейлистов:{C_0}")
+    for i, p in enumerate(files, 1):
+        print(f"  {i:2}) {p.name}   {C_INF}({p.parent.name}){C_0}")
+    try:
+        ans = input("Номер(а) через пробел: ").split()
+    except EOFError:
+        return []
+    return [files[int(a) - 1] for a in ans if a.isdigit() and 0 < int(a) <= len(files)]
+
+
+def download(paths, args):
+    sp = None
+    for path in paths:
+        if not path.is_file():
+            err(f"Файл не найден: {path}")
+            continue
+        rows, kind = parse_dump(path)
+        if not rows:
+            err(f"В файле не найдено треков: {path.name}")
+            continue
+        groups = {}
+        for r in rows:
+            groups.setdefault(args.name or r["playlist"] or path.stem, []).append(r)
+
+        with_id = sum(1 for r in rows if r["sid"])
+        print(f"\n{C_B}━━━ {path.name} ({kind.upper()}) ━━━{C_0}")
+        print(f"Треков: {len(rows)}  (со Spotify ID: {with_id})  плейлистов: {len(groups)}")
+        for r in rows[:5]:
+            print(f"   • {row_label(r)}")
+        if len(rows) > 5:
+            print(f"   … и ещё {len(rows) - 5}")
+        if args.check:
+            continue
+        if not args.yes and not ask(f"Скачать {len(rows)} трек(ов)? [Y/n] "):
+            warn("Отменено")
+            continue
+
+        if sp is None and not args.yt_only:
+            sp = Spotify()
+        wake(True)
+        try:
+            for name, grows in groups.items():
+                dest = ROOT / "Spotify" / safe_name(name)
+                dest.mkdir(parents=True, exist_ok=True)
+                print(f"\n{C_B}▶ {name}{C_0}  →  Download/Termux Downloads/Spotify/{dest.name}/")
+                cache_file = dest / CACHE_NAME
+                try:
+                    cache = json.loads(cache_file.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    cache = {}
+
+                def save_cache(cache=cache, cache_file=cache_file):
+                    try:
+                        cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                    except OSError:
+                        pass
+
+                if not args.yt_only:
+                    resolve(grows, sp, cache, save_cache)
+
+                entries, yt_rows = [], []
+                for pos, r in enumerate(grows, 1):
+                    sid = r["sid"] or (cache.get(row_key(r)) if not args.yt_only else None)
+                    if sid and sp and sp.client:
+                        entries.append(entry_for(sid, name, pos, len(grows), sp.song_fields))
+                    else:
+                        yt_rows.append(r)
+
+                if entries:
+                    run_spotdl(entries, dest, name, args.numbered, args.dry_run)
+                yt_files = run_youtube(yt_rows, dest, name, args.dry_run)
+
+                m3u = dest / f"{safe_name(name)}.m3u8"
+                if yt_files and not args.dry_run:
+                    existing = m3u.read_text(encoding="utf-8").splitlines() if m3u.exists() else ["#EXTM3U"]
+                    for f in yt_files:
+                        if (dest / f).exists() and f not in existing:
+                            existing.append(f)
+                    m3u.write_text("\n".join(existing) + "\n", encoding="utf-8")
+                ok(f"Готово: {name}")
+        finally:
+            wake(False)
+
+        # сохранить сам дамп рядом с остальными выгрузками
+        if args.keep_dump and path.parent == HOME / "downloads":
+            keep = ROOT / "Playlists"
+            keep.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(keep / path.name))
+
+
+# --------------------------------------------------------------------------
+# Выгрузка (export)
+# --------------------------------------------------------------------------
+def export(urls, fmt):
+    try:
+        from spotdl.utils.spotify import SpotifyClient  # type: ignore
+        from spotdl.utils.config import SPOTIFY_OPTIONS  # type: ignore
+        from spotdl.utils.search import get_simple_songs  # type: ignore
+    except ImportError:
+        err("Для выгрузки нужен spotDL.")
+        return 1
+    SpotifyClient.init(client_id=SPOTIFY_OPTIONS["client_id"],
+                       client_secret=SPOTIFY_OPTIONS["client_secret"])
+    out_dir = ROOT / "Playlists"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for url in urls:
+        say(f"Получаю список треков: {url}")
+        try:
+            songs = get_simple_songs([url])
+        except Exception as e:  # noqa: BLE001
+            err(f"Не удалось получить плейлист: {e}")
+            continue
+        if not songs:
+            err("Пусто (плейлист должен быть публичным).")
+            continue
+        name = songs[0].list_name or (songs[0].album_name if "/album/" in url else songs[0].name)
+        base = out_dir / safe_name(name)
+        if fmt in ("csv", "both"):
+            with open(f"{base}.csv", "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Track name", "Artist name", "Album", "Playlist name", "Type", "ISRC", "Spotify - id"])
+                for s in songs:
+                    w.writerow([s.name, ", ".join(s.artists or [s.artist]), s.album_name or "",
+                                name, "Playlist" if "/playlist/" in url else "Album",
+                                s.isrc or "", s.song_id or ""])
+            ok(f"{base.name}.csv — {len(songs)} трек(ов)")
+        if fmt in ("txt", "both"):
+            with open(f"{base}.txt", "w", encoding="utf-8") as f:
+                for s in songs:
+                    f.write(f"{', '.join(s.artists or [s.artist])} - {s.name}\n")
+            ok(f"{base.name}.txt — {len(songs)} трек(ов)")
+    print(f"Папка: Download/Termux Downloads/Playlists/")
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "export":
+        p = argparse.ArgumentParser(prog="playlist-dump export")
+        p.add_argument("urls", nargs="+")
+        p.add_argument("--format", choices=["csv", "txt", "both"], default="both")
+        a = p.parse_args(argv[1:])
+        return export(a.urls, a.format)
+    if argv and argv[0] in ("download", "import"):
+        argv = argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
+    p = argparse.ArgumentParser(prog="playlist-dump", add_help=False)
+    p.add_argument("files", nargs="*", type=Path)
+    p.add_argument("--name")
+    p.add_argument("--numbered", action="store_true")
+    p.add_argument("--yt-only", action="store_true")
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--keep-dump", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true")
+    args = p.parse_args(argv)
+    files = args.files or pick_file()
+    if not files:
+        return 1
+    try:
+        download(files, args)
+    except KeyboardInterrupt:
+        print()
+        warn("Прервано. Запустите ту же команду снова — скачанное будет пропущено.")
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

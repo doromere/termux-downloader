@@ -23,7 +23,7 @@ echo "==> yt-dlp, gallery-dl, gdown ($PY)"
 
 echo "==> Скрипты в ~/bin"
 mkdir -p "$HOME/bin" "$HOME/.config/termux-downloads/cookies"
-for f in termux-url-opener termux-file-editor; do
+for f in termux-url-opener termux-file-editor playlist-dump; do
   if [ -f "$SRC/bin/$f" ]; then cp "$SRC/bin/$f" "$HOME/bin/$f"
   else curl -fsSL "$RAW/bin/$f" -o "$HOME/bin/$f"
   fi

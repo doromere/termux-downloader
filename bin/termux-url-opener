@@ -8,6 +8,8 @@
 #  Команды:
 #    termux-url-opener <ссылка или текст со ссылками>
 #    termux-url-opener --update   обновить yt-dlp, gallery-dl, gdown
+#    termux-url-opener --import файл.csv|txt    скачать плейлист из дампа
+#    termux-url-opener --export ссылка_spotify  выгрузить плейлист в CSV/TXT
 #    termux-url-opener --help
 #
 #  Cookies (для X/Twitter, Instagram, 18+ на YouTube и т.п.):
@@ -343,7 +345,7 @@ process_url() {
 }
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 update_tools() {
@@ -356,6 +358,8 @@ update_tools() {
 case "$1" in
   -h|--help) usage; exit 0 ;;
   --update)  update_tools; exit $? ;;
+  --import)  shift; exec "$HOME/bin/playlist-dump" "$@" ;;
+  --export)  shift; exec "$HOME/bin/playlist-dump" export "$@" ;;
   "")        usage; exit 1 ;;
 esac
 
