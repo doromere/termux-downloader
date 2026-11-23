@@ -42,6 +42,7 @@ curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scrip
 | Музыка | Spotify | spotDL, альбомы/плейлисты — в подпапки |
 | Видео (меню качества) | YouTube, VK, OK, Rutube, Dzen, Facebook, Twitch, Vimeo, Dailymotion, Bilibili, Coub | yt-dlp: лучшее / 1080p / 720p / только MP3 |
 | Аудио | YouTube Music, SoundCloud, Bandcamp, Mixcloud, Yandex Music | yt-dlp → MP3 с обложкой и тегами |
+| Музыка с DRM | Apple Music, Deezer, Tidal, Amazon Music (и Yandex Music, если yt-dlp не справился) | DRM не взламывается: трек/альбом находится через song.link и качается из Spotify (spotDL) или YouTube Music |
 | Фото + видео | Twitter/X, Instagram, Threads, Pinterest, Bluesky, Tumblr, Imgur, Pixiv, DeviantArt, ArtStation | gallery-dl → yt-dlp |
 | Соцсети | TikTok, Reddit, Telegram (публичные посты) | yt-dlp → gallery-dl |
 | Файлы | Google Drive, GitHub, magnet / .torrent, прямые ссылки | gdown, git, aria2c, curl |
@@ -72,5 +73,8 @@ termux-url-opener --help
 
 ## Ограничения
 
-Не поддерживаются сервисы с DRM (Apple Music, Deezer, Netflix), подкасты Spotify, музыка VK,
-закрытые чаты Telegram. Yandex Music часто требует cookies.
+- Видеостриминги с DRM (Netflix, Disney+, Prime Video, Max, Apple TV, Кинопоиск, ivi, Okko, Wink и т.п.)
+  не скачиваются — обход DRM незаконен. Используйте офлайн-загрузку в официальных приложениях.
+- Плейлисты Apple Music / Deezer / Tidal song.link не поддерживает: перенесите плейлист в Spotify
+  (tunemymusic.com, soundiiz.com) и поделитесь ссылкой Spotify. Лимит song.link — 10 запросов в минуту.
+- Не поддерживаются подкасты Spotify, музыка VK, закрытые чаты Telegram.

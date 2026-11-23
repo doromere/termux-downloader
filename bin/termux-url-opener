@@ -71,7 +71,14 @@ detect_service() {
     ok.ru|*.ok.ru)                                             SERVICE="OK";            TYPE=video ;;
     rutube.ru|*.rutube.ru)                                     SERVICE="Rutube";        TYPE=video ;;
     dzen.ru|*.dzen.ru|zen.yandex.ru)                           SERVICE="Dzen";          TYPE=video ;;
-    music.yandex.ru|music.yandex.com|music.yandex.*)           SERVICE="Yandex Music";  TYPE=audio ;;
+    music.yandex.ru|music.yandex.com|music.yandex.*)           SERVICE="Yandex Music";  TYPE=audio_convert ;;
+    music.apple.com|itunes.apple.com|geo.music.apple.com)      SERVICE="Apple Music";   TYPE=convert ;;
+    deezer.com|*.deezer.com|deezer.page.link|dzr.page.link)    SERVICE="Deezer";        TYPE=convert ;;
+    tidal.com|*.tidal.com)                                     SERVICE="Tidal";         TYPE=convert ;;
+    music.amazon.*)                                            SERVICE="Amazon Music";  TYPE=convert ;;
+    netflix.com|*.netflix.com|disneyplus.com|*.disneyplus.com|primevideo.com|*.primevideo.com|\
+    max.com|*.max.com|hbomax.com|tv.apple.com|kinopoisk.ru|hd.kinopoisk.ru|ivi.ru|okko.tv|start.ru|wink.ru|more.tv|kion.ru)
+                                                               SERVICE="DRM";           TYPE=drm ;;
     reddit.com|*.reddit.com|redd.it|*.redd.it)                 SERVICE="Reddit";        TYPE=social ;;
     pinterest.*|*.pinterest.*|pin.it|*.pinimg.com)             SERVICE="Pinterest";     TYPE=gallery ;;
     facebook.com|*.facebook.com|fb.watch|fb.com)               SERVICE="Facebook";      TYPE=video ;;
@@ -108,7 +115,7 @@ resolve_short() {
   local r
   if [ "$DRY" != 1 ]; then
     case "$1" in
-      *://t.co/*|*://vk.cc/*|*://bit.ly/*|*://spotify.link/*|*://pin.it/*|*://goo.gl/*|*://tinyurl.com/*|\
+      *://t.co/*|*://vk.cc/*|*://bit.ly/*|*://spotify.link/*|*://link.deezer.com/*|*://deezer.page.link/*|*://dzr.page.link/*|*://pin.it/*|*://goo.gl/*|*://tinyurl.com/*|\
       *://clck.ru/*|*://is.gd/*|*://cutt.ly/*|*://on.soundcloud.com/*|*://redd.it/*|*reddit.com/r/*/s/*)
         r=$(curl -sL -A "Mozilla/5.0" -o /dev/null -w '%{url_effective}' --max-time 15 "$1" 2>/dev/null)
         [ -n "$r" ] && { printf '%s' "$r"; return; } ;;
@@ -206,6 +213,44 @@ dl_torrent() {
   run aria2c --dir="$DEST" --seed-time=0 --summary-interval=0 --follow-torrent=true "$1"
 }
 
+# Apple Music / Deezer / Tidal / Amazon / Yandex: DRM не взламываем, а находим тот же
+# трек/альбом через song.link и качаем его из Spotify (spotDL) или YouTube Music.
+dl_convert() {
+  local json sp yt
+  say "Ищу этот трек/альбом на других площадках (song.link)…"
+  if [ -n "$TUO_SONGLINK_JSON" ]; then json="$TUO_SONGLINK_JSON"
+  else json=$(curl -sG --max-time 20 "https://api.song.link/v1-alpha.1/links" --data-urlencode "url=$1" 2>/dev/null)
+  fi
+  read -r sp yt < <(printf '%s' "$json" | "$PY" -c '
+import json, sys
+try: d = json.load(sys.stdin).get("linksByPlatform", {})
+except Exception: d = {}
+u = lambda k: (d.get(k) or {}).get("url") or "-"
+yt = u("youtubeMusic")
+print(u("spotify"), yt if yt != "-" else u("youtube"))
+' 2>/dev/null)
+  if [ -n "$sp" ] && [ "$sp" != "-" ] && { command -v spotdl >/dev/null 2>&1 || [ "$DRY" = 1 ]; }; then
+    say "Найдено в Spotify: $sp"
+    dl_spotify "$sp" && return 0
+  fi
+  if [ -n "$yt" ] && [ "$yt" != "-" ]; then
+    say "Найдено на YouTube: $yt"
+    ytdlp_audio "$yt" && return 0
+  fi
+  err "Не удалось найти совпадение (song.link не нашёл или лимит 10 запросов/мин)."
+  case "$1" in
+    */playlist/*|*/pl.*) warn "Плейлисты song.link не поддерживает: перенесите плейлист в Spotify (tunemymusic.com / soundiiz.com) и поделитесь ссылкой Spotify." ;;
+  esac
+  return 1
+}
+
+dl_drm() {
+  err "Этот сервис защищён DRM (Widevine/FairPlay)."
+  warn "Обход DRM незаконен (ЕС/Франция, РФ, США), скрипт этого не делает."
+  warn "Используйте офлайн-загрузку в официальном приложении сервиса."
+  return 1
+}
+
 dl_generic() {
   ytdlp_video "$1" "res,ext:mp4:m4a" && return 0
   warn "yt-dlp не справился — пробую gallery-dl…"
@@ -246,7 +291,7 @@ process_url() {
   url=$(printf '%s' "$1" | sed -E 's/[.,;!»"'"'"')]+$//')
   url=$(resolve_short "$url")
   detect_service "$url"
-  if [ "$TYPE" != spotify ] && [ "$TYPE" != torrent ]; then
+  if [ "$TYPE" != spotify ] && [ "$TYPE" != torrent ] && [ "$TYPE" != drm ]; then
     case "${url%%[?#]*}" in *.torrent|*.TORRENT) TYPE=torrent ;; esac
     if [ "$TYPE" != torrent ] && is_direct_file "$url"; then
       TYPE=direct
@@ -262,7 +307,7 @@ process_url() {
   for f in "$COOKIES_DIR/$SLUG.txt" "$COOKIES_DIR/cookies.txt"; do
     [ -f "$f" ] && { COOK=(--cookies "$f"); break; }
   done
-  mkdir -p "$DEST" 2>/dev/null
+  [ "$TYPE" = drm ] || mkdir -p "$DEST" 2>/dev/null
 
   echo
   printf '%s\n' "${c_b}━━━ ${SERVICE} ━━━${c_0}"
@@ -272,6 +317,9 @@ process_url() {
 
   case "$TYPE" in
     spotify) dl_spotify "$url" ;;
+    convert) dl_convert "$url" ;;
+    audio_convert) ytdlp_audio "$url" || { warn "Пробую найти трек через song.link…"; dl_convert "$url"; } ;;
+    drm)     dl_drm ;;
     video)   video_menu "$url" ;;
     audio)   ytdlp_audio "$url" ;;
     social)  ytdlp_video "$url" "res,ext:mp4:m4a" || { warn "Пробую gallery-dl…"; gdl "$url"; } ;;
