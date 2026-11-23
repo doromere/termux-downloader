@@ -10,6 +10,7 @@
 #    termux-url-opener --update   обновить yt-dlp, gallery-dl, gdown
 #    termux-url-opener --import файл.csv|txt    скачать плейлист из дампа
 #    termux-url-opener --export ссылка_spotify  выгрузить плейлист в CSV/TXT
+#    termux-url-opener --history [N]  последние N загрузок (журнал хранится приватно)
 #    termux-url-opener --help
 #
 #  Cookies (для X/Twitter, Instagram, 18+ на YouTube и т.п.):
@@ -20,7 +21,7 @@
 ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
 CONF="$HOME/.config/termux-downloads"
 COOKIES_DIR="$CONF/cookies"
-LOG="$ROOT/.history.log"
+LOG="$CONF/history.log"       # приватно (в общей памяти его могли бы читать другие приложения)
 MENU_TIMEOUT=15              # секунд до автоматического выбора пункта 1
 DRY="${TUO_DRY_RUN:-0}"      # 1 = только показать команды (для отладки)
 
@@ -49,6 +50,38 @@ ensure_pkg() {   # ensure_pkg <команда> <пакет termux>
   [ "$DRY" = 1 ] && return 0
   say "Устанавливаю $2…"
   pkg install -y "$2" && hash -r && command -v "$1" >/dev/null 2>&1
+}
+
+# Подтверждение: Enter/y — да, n — нет, тайм-аут — НЕТ (защита от загрузок без участия
+# пользователя: любое приложение может отправить ссылку в Termux через intent).
+confirm() {  # confirm <вопрос> <секунд>
+  [ "$DRY" = 1 ] && return 0
+  [ "${TUO_YES:-0}" = 1 ] && return 0
+  local a
+  read -r -t "$2" -p "$1 [Enter — да / n — нет; через $2 с — отмена]: " a || { echo; return 1; }
+  case "${a,,}" in n*|н*) return 1 ;; esac
+  return 0
+}
+
+# Ссылка на «всё сразу»: канал, плейлист YouTube, дискография на Spotify
+is_mass() {
+  case "$1" in
+    *youtube.com/playlist*|*youtube.com/@*|*youtube.com/channel/*|*youtube.com/c/*|*youtube.com/user/*|\
+    *open.spotify.com/artist/*|*open.spotify.com/*/artist/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Только http(s) и magnet; «голый» домен дополняется https://. Всё остальное отклоняется,
+# чтобы текст вида «--exec=…» не попал в yt-dlp/curl как опция.
+normalize_url() {
+  case "$1" in
+    http://*|https://*|magnet:\?*) printf '%s' "$1"; return 0 ;;
+  esac
+  if [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(/[^[:space:]]*)?$ ]]; then
+    printf 'https://%s' "$1"; return 0
+  fi
+  return 1
 }
 
 # ---------- определение сервиса ----------
@@ -148,19 +181,19 @@ ytdlp_video() {  # ytdlp_video <url> <сортировка форматов>
   ensure_pip yt-dlp "yt-dlp[default]" || return 1
   ensure_js
   run yt-dlp "${YTDLP_BASE[@]}" "${JS_RT[@]}" "${COOK[@]}" -S "$2" --merge-output-format mp4 \
-      -o "$(out_tmpl)" "$1"
+      -o "$(out_tmpl)" -- "$1"
 }
 
 ytdlp_audio() {
   ensure_pip yt-dlp "yt-dlp[default]" || return 1
   ensure_js
   run yt-dlp "${YTDLP_BASE[@]}" "${JS_RT[@]}" "${COOK[@]}" -x --audio-format mp3 --audio-quality 0 \
-      --embed-thumbnail --convert-thumbnails jpg -o "$(out_tmpl)" "$1"
+      --embed-thumbnail --convert-thumbnails jpg -o "$(out_tmpl)" -- "$1"
 }
 
 gdl() {
   ensure_pip gallery-dl gallery-dl || return 1
-  run gallery-dl "${COOK[@]}" -D "$DEST" "$1"
+  run gallery-dl "${COOK[@]}" -D "$DEST" -- "$1"
 }
 
 video_menu() {
@@ -188,6 +221,14 @@ dl_spotify() {
     err "spotdl не установлен. Установка: curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scripts/termux.sh | sh"
     return 1
   fi
+  case "$1" in
+    */collection/*)
+      err "«Любимые треки» по ссылке не скачать: Spotify требует вход через API (только Premium)."
+      warn "Выгрузите их в CSV на tunemymusic.com и поделитесь файлом в Termux (playlist-dump)."
+      return 1 ;;
+    */episode/*|*/show/*)
+      err "Подкасты Spotify spotDL не поддерживает."; return 1 ;;
+  esac
   local tmpl='{artists} - {title}.{output-ext}'
   case "$1" in
     */album/*)    tmpl='{album}/{artists} - {title}.{output-ext}' ;;
@@ -200,7 +241,11 @@ dl_spotify() {
 
 dl_direct() {
   ensure_pkg curl curl || return 1
-  run curl -L --fail --retry 3 -A "Mozilla/5.0" --output-dir "$DEST" -OJ "$1"
+  case "${1%%[?#]*}" in
+    */) run curl -L --fail --retry 3 -A "Mozilla/5.0" --no-clobber \
+            -o "$DEST/download_$(date +%Y%m%d-%H%M%S)" "$1" ;;
+    *)  run curl -L --fail --retry 3 -A "Mozilla/5.0" --no-clobber --output-dir "$DEST" -OJ "$1" ;;
+  esac
 }
 
 dl_git() {
@@ -212,9 +257,19 @@ dl_git() {
       dl_direct "$(printf '%s' "$url" | sed -E 's#https?://(www\.)?github\.com/([^/]+)/([^/]+)/blob/#https://raw.githubusercontent.com/\2/\3/#')"
       return ;;
   esac
+  repo=$(printf '%s' "$url" | sed -nE 's#^https?://(www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+).*#\2/\3#p')
+  repo="${repo%.git}"
+  if [ -z "$repo" ]; then
+    err "Это не ссылка на репозиторий GitHub (нужно github.com/владелец/репозиторий)."; return 1
+  fi
   ensure_pkg git git || return 1
-  repo=$(printf '%s' "$url" | sed -E 's#^https?://(www\.)?github\.com/([^/]+)/([^/?#]+).*#\2/\3#; s#\.git$##')
-  run git clone --depth 1 "https://github.com/$repo.git" "$DEST/${repo//\//_}"
+  local target="$DEST/${repo//\//_}"
+  if [ -d "$target/.git" ]; then
+    say "Репозиторий уже скачан — обновляю"
+    run git -C "$target" pull --ff-only
+  else
+    run git clone --depth 1 "https://github.com/$repo.git" "$target"
+  fi
 }
 
 dl_gdrive() {
@@ -261,6 +316,15 @@ print(u("spotify"), yt if yt != "-" else u("youtube"))
   return 1
 }
 
+dl_video() {
+  video_menu "$1"
+  local r=$?
+  [ $r -eq 1 ] || return $r
+  case "$1" in *vk.com/*|*vk.ru/*|*vkvideo.ru/*) ;; *) return 1 ;; esac  # посты VK с фото
+  warn "yt-dlp не справился — пробую gallery-dl (посты с фото и т.п.)…"
+  gdl "$1"
+}
+
 dl_drm() {
   err "Этот сервис защищён DRM (Widevine/FairPlay)."
   warn "Обход DRM незаконен (ЕС/Франция, РФ, США), скрипт этого не делает."
@@ -305,8 +369,10 @@ hint_on_fail() {
 
 process_url() {
   local url rc
-  url=$(printf '%s' "$1" | sed -E 's/[.,;!»"'"'"')]+$//')
+  url=$(printf '%s' "$1" | sed -E 's/[.,;!»"'"'"']+$//')
+  url=$(normalize_url "$url") || { err "Это не ссылка: $1"; return 1; }
   url=$(resolve_short "$url")
+  url=$(normalize_url "$url") || { err "Короткая ссылка привела не на http(s): $1"; return 1; }
   detect_service "$url"
   if [ "$TYPE" != spotify ] && [ "$TYPE" != torrent ] && [ "$TYPE" != drm ]; then
     case "${url%%[?#]*}" in *.torrent|*.TORRENT) TYPE=torrent ;; esac
@@ -333,11 +399,20 @@ process_url() {
   [ ${#COOK[@]} -gt 0 ] && echo "Cookies: ${COOK[1]}"
 
   case "$TYPE" in
+    torrent|direct|git|generic)
+      confirm "Скачать?" 30 || { warn "Отменено"; log_line SKIP "$url"; return 2; } ;;
+  esac
+  if is_mass "$url"; then
+    warn "Это канал / плейлист / дискография — будет скачано ВСЁ (может быть очень много)."
+    confirm "Продолжить?" 30 || { warn "Отменено"; log_line SKIP "$url"; return 2; }
+  fi
+
+  case "$TYPE" in
     spotify) dl_spotify "$url" ;;
     convert) dl_convert "$url" ;;
     audio_convert) ytdlp_audio "$url" || { warn "Пробую найти трек через song.link…"; dl_convert "$url"; } ;;
     drm)     dl_drm ;;
-    video)   video_menu "$url" ;;
+    video)   dl_video "$url" ;;
     audio)   ytdlp_audio "$url" ;;
     social)  ytdlp_video "$url" "res,ext:mp4:m4a" || { warn "Пробую gallery-dl…"; gdl "$url"; } ;;
     gallery) gdl "$url" || { warn "Пробую yt-dlp…"; ytdlp_video "$url" "res,ext:mp4:m4a"; } ;;
@@ -376,6 +451,7 @@ case "$1" in
   --update)  update_tools; exit $? ;;
   --import)  shift; exec "$HOME/bin/playlist-dump" "$@" ;;
   --export)  shift; exec "$HOME/bin/playlist-dump" export "$@" ;;
+  --history) [ -f "$LOG" ] && tail -n "${2:-30}" "$LOG" || echo "Журнал пуст."; exit 0 ;;
   "")        usage; exit 1 ;;
 esac
 
@@ -383,31 +459,62 @@ if [ "$DRY" != 1 ] && [ ! -d "$HOME/storage/shared" ]; then
   say "Нужен доступ к памяти телефона — разрешите его в появившемся окне."
   termux-setup-storage; sleep 4
 fi
-mkdir -p "$ROOT" "$COOKIES_DIR" 2>/dev/null
+mkdir -p "$CONF" "$COOKIES_DIR" 2>/dev/null
+chmod 700 "$CONF" "$COOKIES_DIR" 2>/dev/null
+umask 077 2>/dev/null; touch "$LOG" 2>/dev/null; umask 022
+if ! mkdir -p "$ROOT" 2>/dev/null || [ ! -w "$ROOT" ]; then
+  err "Нет доступа к памяти телефона: $ROOT"
+  warn "Выполните termux-setup-storage и разрешите Termux доступ к файлам."
+  [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
+  exit 1
+fi
+
+# wake-lock снимается при любом выходе, в т.ч. Ctrl+C и закрытии сессии
+WAKE=0
+cleanup() {
+  if [ "$WAKE" = 1 ] && command -v termux-wake-unlock >/dev/null 2>&1; then termux-wake-unlock; fi
+  WAKE=0
+}
+trap cleanup EXIT
+trap 'echo; warn "Прервано"; exit 130' INT TERM HUP
 
 # Локальный .torrent-файл (передаётся из termux-file-editor)
 if [ -f "$1" ]; then
   case "${1,,}" in
     *.torrent)
       SERVICE="Torrents"; DEST="$ROOT/$SERVICE"; mkdir -p "$DEST"
-      dl_torrent "$1"; rc=$?; log_line "$([ $rc -eq 0 ] && echo OK || echo FAIL)" "$1"
+      echo "Торрент-файл: $(basename "$1")"
+      if confirm "Скачать?" 30; then dl_torrent "$1"; rc=$?; else warn "Отменено"; rc=2; fi; log_line "$([ $rc -eq 0 ] && echo OK || echo FAIL)" "$1"
       [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
       exit $rc ;;
   esac
 fi
 
 INPUT="$*"
-mapfile -t URLS < <(printf '%s\n' "$INPUT" | grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+')
+declare -A SEEN; URLS=()
+while IFS= read -r u; do
+  u=$(printf '%s' "$u" | sed -E 's/[.,;!»"'"'"']+$//')
+  # «)» в конце убираем, только если она лишняя (непарная): wiki/Foo_(bar) остаётся целым
+  while [[ "$u" == *")" ]]; do
+    o="${u//[^(]/}"; c="${u//[^)]/}"
+    [ ${#c} -gt ${#o} ] || break
+    u="${u%)}"
+  done
+  u=$(printf '%s' "$u" | sed -E 's/[.,;!»"'"'"']+$//')
+  [ -n "$u" ] && [ -z "${SEEN[$u]}" ] || continue
+  SEEN[$u]=1; URLS+=("$u")
+done < <(printf '%s\n' "$INPUT" | grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+')
+# без схемы: «youtube.com/watch?v=…» — normalize_url решит, ссылка это или нет
 [ ${#URLS[@]} -eq 0 ] && URLS=("$INPUT")
 
-[ "$DRY" != 1 ] && command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
+if [ "$DRY" != 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock; WAKE=1; fi
 
 total=${#URLS[@]}; okc=0; failc=0
 for u in "${URLS[@]}"; do
   process_url "$u"; case $? in 0) okc=$((okc+1));; 2) ;; *) failc=$((failc+1));; esac
 done
 
-[ "$DRY" != 1 ] && command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
+cleanup
 
 echo
 if [ $failc -eq 0 ]; then
@@ -415,7 +522,7 @@ if [ $failc -eq 0 ]; then
   notify "Загрузка завершена" "$okc из $total → Download/Termux Downloads"
   [ "$DRY" = 1 ] || read -r -n 1 -s -t 10 -p "Окно закроется через 10 с (или нажмите любую клавишу)…"
 else
-  err "Ошибок: $failc из $total. История: Download/Termux Downloads/.history.log"
+  err "Ошибок: $failc из $total. Журнал: termux-url-opener --history"
   notify "Загрузка с ошибками" "Ошибок: $failc из $total"
   [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
 fi

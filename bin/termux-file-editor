@@ -3,42 +3,51 @@
 # файл или текст, который не является «чистой» ссылкой
 # (например: «Смотри, какое видео https://youtu.be/...»).
 #  - .csv / .txt-список треков (TuneMyMusic, Exportify…) → playlist-dump
-#  - текст со ссылками  → передаётся в termux-url-opener
-#  - .torrent           → скачивается через aria2c
+#  - текст со ссылками  → ссылки передаются в termux-url-opener
+#  - .torrent           → скачивается через aria2c (после подтверждения)
 #  - любой другой файл  → Download/Termux Downloads/Shared Files/
 
 FILE="$1"
 ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
 OPENER="$HOME/bin/termux-url-opener"
+PLD="$HOME/bin/playlist-dump"
+
+pause() { read -r -n 1 -s -t "${1:-10}" -p "Окно закроется через ${1:-10} с (или нажмите любую клавишу)…"; echo; }
 
 [ -f "$FILE" ] || { echo "Файл не найден: $FILE"; exit 1; }
 name=$(basename "$FILE")
+is_text=0; grep -Iq . "$FILE" 2>/dev/null && is_text=1
 
-PLD="$HOME/bin/playlist-dump"
+run_playlist_dump() {
+  if [ -x "$PLD" ]; then exec "$PLD" --keep-dump "$FILE"; fi
+  echo "✘ playlist-dump не установлен. Обновите: cd ~/termux-downloader && git pull && bash install.sh"
+  pause 30; exit 1
+}
 
 case "${name,,}" in
   *.torrent) exec "$OPENER" "$FILE" ;;
-  *.csv)     exec "$PLD" --keep-dump "$FILE" ;;
+  *.csv)     [ "$is_text" = 1 ] && run_playlist_dump ;;
 esac
 
-# Список треков: 3+ строк и нет «чужих» ссылок (ссылки на треки Spotify допустимы)
-if grep -Iq . "$FILE" 2>/dev/null; then
+if [ "$is_text" = 1 ]; then
+  # Список треков: 3+ строк и нет «чужих» ссылок (ссылки на треки Spotify допустимы)
   lines=$(grep -c '[^[:space:]]' "$FILE")
   foreign=$(grep -oE 'https?://[^[:space:]]+' "$FILE" | grep -vc 'open\.spotify\.com/\(intl-[a-z-]*/\)\{0,1\}track/')
   if [ "$lines" -ge 3 ] && [ "$foreign" -eq 0 ]; then
-    exec "$PLD" --keep-dump "$FILE"
+    run_playlist_dump
+  fi
+
+  # Текст со ссылками: передаём только сами ссылки (без дублей) — весь текст одним
+  # аргументом может превысить лимит ядра (128 КБ на аргумент)
+  mapfile -t urls < <(grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+' "$FILE" | awk '!seen[$0]++' | head -n 200)
+  if [ ${#urls[@]} -gt 0 ]; then
+    rm -f "$FILE"
+    exec "$OPENER" "${urls[@]}"
   fi
 fi
 
-size=$(stat -c %s "$FILE" 2>/dev/null || echo 0)
-if [ "$size" -lt 200000 ] && grep -Iq . "$FILE" && grep -qE '(https?://|magnet:\?)' "$FILE"; then
-  text=$(cat "$FILE")
-  rm -f "$FILE"
-  exec "$OPENER" "$text"
-fi
-
 dest="$ROOT/Shared Files"
-mkdir -p "$dest"
+mkdir -p "$dest" || { echo "✘ Нет доступа к памяти телефона (termux-setup-storage)"; pause 30; exit 1; }
 target="$dest/$name"
 if [ -e "$target" ]; then
   base="${name%.*}"; ext="${name##*.}"
@@ -46,5 +55,4 @@ if [ -e "$target" ]; then
   target="$dest/${base}_$(date +%Y%m%d-%H%M%S)$ext"
 fi
 mv "$FILE" "$target" && echo "✔ Сохранено: Download/Termux Downloads/Shared Files/$(basename "$target")"
-read -r -n 1 -s -t 10 -p "Окно закроется через 10 с (или нажмите любую клавишу)…"
-echo
+pause 10
