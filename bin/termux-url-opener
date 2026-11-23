@@ -129,18 +129,32 @@ resolve_short() {
 # ---------- загрузчики ----------
 YTDLP_BASE=(--no-playlist --windows-filenames --no-mtime --embed-metadata
             --retries 10 --fragment-retries 10 --concurrent-fragments 4)
+
+# YouTube требует JavaScript-движок. Deno под Android не работает, поэтому
+# используем Node.js (pkg install nodejs-lts) — yt-dlp поддерживает его официально.
+JS_RT=(); SPOTDL_JS=()
+ensure_js() {
+  [ ${#JS_RT[@]} -gt 0 ] && return 0
+  command -v deno >/dev/null 2>&1 && return 0
+  ensure_pkg node nodejs-lts || { warn "Node.js не установлен — часть видео YouTube может не скачаться."; return 0; }
+  command -v node >/dev/null 2>&1 || [ "$DRY" = 1 ] || return 0
+  JS_RT=(--js-runtimes node)
+  SPOTDL_JS=(--yt-dlp-args "--js-runtimes node")
+}
 # плейлисты/альбомы попадают в подпапку с их названием, одиночные файлы — прямо в папку сервиса
 out_tmpl() { printf '%s' "$DEST/%(playlist_title|)s/%(title).150B [%(id)s].%(ext)s"; }
 
 ytdlp_video() {  # ytdlp_video <url> <сортировка форматов>
-  ensure_pip yt-dlp yt-dlp || return 1
-  run yt-dlp "${YTDLP_BASE[@]}" "${COOK[@]}" -S "$2" --merge-output-format mp4 \
+  ensure_pip yt-dlp "yt-dlp[default]" || return 1
+  ensure_js
+  run yt-dlp "${YTDLP_BASE[@]}" "${JS_RT[@]}" "${COOK[@]}" -S "$2" --merge-output-format mp4 \
       -o "$(out_tmpl)" "$1"
 }
 
 ytdlp_audio() {
-  ensure_pip yt-dlp yt-dlp || return 1
-  run yt-dlp "${YTDLP_BASE[@]}" "${COOK[@]}" -x --audio-format mp3 --audio-quality 0 \
+  ensure_pip yt-dlp "yt-dlp[default]" || return 1
+  ensure_js
+  run yt-dlp "${YTDLP_BASE[@]}" "${JS_RT[@]}" "${COOK[@]}" -x --audio-format mp3 --audio-quality 0 \
       --embed-thumbnail --convert-thumbnails jpg -o "$(out_tmpl)" "$1"
 }
 
@@ -180,7 +194,8 @@ dl_spotify() {
     */playlist/*) tmpl='{list-name}/{artists} - {title}.{output-ext}' ;;
     */artist/*)   tmpl='{album-artist}/{album}/{artists} - {title}.{output-ext}' ;;
   esac
-  run spotdl download "$1" --output "$DEST/$tmpl" --threads 2 --max-retries 5
+  ensure_js
+  run spotdl download "$1" --output "$DEST/$tmpl" --threads 2 --max-retries 5 "${SPOTDL_JS[@]}"
 }
 
 dl_direct() {
@@ -349,7 +364,8 @@ usage() {
 }
 
 update_tools() {
-  "$PY" -m pip install -U yt-dlp gallery-dl gdown && ok "yt-dlp, gallery-dl и gdown обновлены."
+  "$PY" -m pip install -U "yt-dlp[default]" gallery-dl gdown && ok "yt-dlp, gallery-dl и gdown обновлены."
+  command -v node >/dev/null 2>&1 || pkg install -y nodejs-lts
   echo "spotDL обновляется отдельно (нужен rust):"
   echo "  pkg install -y rust binutils && ANDROID_API_LEVEL=\$(getprop ro.build.version.sdk) $PY -m pip install -U spotdl"
 }
