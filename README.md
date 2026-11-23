@@ -22,7 +22,8 @@ git clone https://github.com/doromere/termux-downloader
 bash termux-downloader/install.sh
 ```
 
-Установщик ставит `ffmpeg`, `aria2`, `git`, `yt-dlp`, `gallery-dl`, `gdown`, копирует скрипты в `~/bin`
+Установщик ставит `ffmpeg`, `aria2`, `git`, `yt-dlp`, `gallery-dl`, `gdown`, копирует скрипты
+(`termux-url-opener`, `termux-file-editor`, `playlist-dump`) в `~/bin`
 и добавляет `~/bin` в `PATH`.
 
 **Spotify** (необязательно, занимает много места при сборке):
@@ -49,6 +50,37 @@ curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scrip
 | Остальное | любые сайты | yt-dlp → gallery-dl → curl |
 
 Короткие ссылки (`t.co`, `vk.cc`, `spotify.link`, `pin.it`, `reddit.com/…/s/…`) раскрываются автоматически.
+
+## Плейлисты из дампов CSV / TXT (`playlist-dump`)
+
+Скачивание по выгрузкам из **TuneMyMusic**, **Exportify**, Soundiiz или по своему списку
+«Исполнитель - Название» (по одному треку в строке). Так можно скачать даже «Любимые треки»
+Spotify без Premium и без API-ключа: выгрузите их в CSV/TXT через tunemymusic.com.
+
+```bash
+playlist-dump                          # выбрать файл из папки Download
+playlist-dump "~/storage/shared/Download/Liked Songs.csv"
+playlist-dump файл.csv --numbered      # нумеровать треки по порядку
+playlist-dump файл.csv --check         # только показать, что распознано
+```
+
+Или в файловом менеджере: файл → «Поделиться» → **Termux** → **Edit**.
+
+Как работает:
+1. Треки со Spotify ID (колонки `Spotify - id`, `Track URI`, ссылки `open.spotify.com/track/…`) идут сразу в spotDL.
+2. Остальные ищутся в Spotify с проверкой совпадения названия и исполнителя.
+3. Найденные скачиваются spotDL одним пакетом (ошибка одного трека не останавливает остальные).
+4. Не найденные — с YouTube (MP3 с обложкой); их список сохраняется в `.not-found.txt`.
+5. Создаётся плейлист `<имя>.m3u8` для музыкальных плееров.
+
+Результат: `Download/Termux Downloads/Spotify/<имя плейлиста>/`. Повторный запуск докачивает
+только недостающее (результаты поиска кэшируются в `.playlist-dump.json`).
+
+**Выгрузка** публичного плейлиста/альбома Spotify в CSV (формат TuneMyMusic) и TXT:
+
+```bash
+playlist-dump export https://open.spotify.com/playlist/…    # → Termux Downloads/Playlists/
+```
 
 ## Cookies (X, Instagram, 18+ и т.п.)
 
