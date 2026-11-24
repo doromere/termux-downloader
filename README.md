@@ -158,3 +158,7 @@ YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno
 - Ссылка, присланная в Termux, может прийти из любого приложения: поэтому принимаются только
   `http(s)://`, `magnet:` и «голые» домены (им дописывается `https://`); всё, что похоже на опцию
   (`--exec=…`), отклоняется, а «массовые» загрузки требуют подтверждения.
+
+## Android-приложение (без Termux, в разработке)
+
+В каталоге [android/](android/) находится нативное Android-приложение на **Kotlin + Jetpack Compose + `youtubedl-android`** (`yt-dlp` + `ffmpeg` + `aria2c`), с приёмом ссылок через «Поделиться», `ForegroundService`, живыми уведомлениями и сохранением через MediaStore/Downloads. Debug APK собирается автоматически в GitHub Actions ([android.yml](.github/workflows/android.yml)).
