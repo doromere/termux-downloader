@@ -59,12 +59,24 @@ done
 # журнал раньше лежал в общей памяти (его могли читать другие приложения) — переносим
 OLD_LOG="$HOME/storage/shared/Download/Termux Downloads/.history.log"
 if [ -f "$OLD_LOG" ]; then
-  cat "$OLD_LOG" >> "$CONF/history.log" && rm -f "$OLD_LOG"
-  chmod 600 "$CONF/history.log"
-  echo "   журнал загрузок перенесён в ~/.config/termux-downloads/history.log"
+  # umask 077 — файл сразу создаётся с правами 600; ошибка переноса не прерывает установку (set -e)
+  if (umask 077; cat "$OLD_LOG" >> "$CONF/history.log"); then
+    rm -f "$OLD_LOG"
+    echo "   журнал загрузок перенесён в ~/.config/termux-downloads/history.log"
+  else
+    echo "   ! не удалось перенести старый журнал: $OLD_LOG"
+  fi
+  chmod 600 "$CONF/history.log" 2>/dev/null || true
 fi
 
-grep -q 'HOME/bin' "$HOME/.bashrc" 2>/dev/null || echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
+# PATH для bash (оболочка Termux по умолчанию), а также zsh, если он настроен
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  [ "$rc" = "$HOME/.bashrc" ] || [ -f "$rc" ] || continue
+  grep -qs 'HOME/bin' "$rc" || echo 'export PATH="$HOME/bin:$PATH"' >> "$rc"
+done
+if [ -d "$HOME/.config/fish" ] && ! grep -qs 'HOME/bin' "$HOME/.config/fish/config.fish"; then
+  echo 'fish_add_path -g $HOME/bin' >> "$HOME/.config/fish/config.fish"
+fi
 
 echo
 echo "✔ Готово. Перезапустите Termux (или выполните: source ~/.bashrc)."

@@ -9,6 +9,7 @@
 
 FILE="$1"
 ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
+ROOT="${ROOT/#\~/$HOME}"
 OPENER="$HOME/bin/termux-url-opener"
 PLD="$HOME/bin/playlist-dump"
 
@@ -39,10 +40,18 @@ if [ "$is_text" = 1 ]; then
 
   # Текст со ссылками: передаём только сами ссылки (без дублей) — весь текст одним
   # аргументом может превысить лимит ядра (128 КБ на аргумент)
+  # (если ссылок со схемой нет — «голые» домены с путём: youtube.com/watch?v=…, как в termux-url-opener)
   mapfile -t urls < <(grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+' "$FILE" | awk '!seen[$0]++' | head -n 200)
+  if [ ${#urls[@]} -eq 0 ]; then
+    mapfile -t urls < <(grep -oiE '(^|[[:space:](])(www\.)?([a-z0-9-]+\.)+[a-z]{2,}/[^[:space:]<>"]*' "$FILE" \
+                        | sed -E 's/^[[:space:](]+//' | awk '!seen[$0]++' | head -n 200)
+  fi
   if [ ${#urls[@]} -gt 0 ]; then
-    rm -f "$FILE"
-    exec "$OPENER" "${urls[@]}"
+    # исходный текст удаляем только после успешной загрузки — при ошибке он остаётся в ~/downloads
+    "$OPENER" "${urls[@]}"
+    rc=$?
+    [ $rc -eq 0 ] && rm -f "$FILE"
+    exit $rc
   fi
 fi
 

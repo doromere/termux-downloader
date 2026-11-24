@@ -19,6 +19,8 @@
 # =====================================================================
 
 ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
+ROOT="${ROOT/#\~/$HOME}"     # TUO_ROOT="~/…" в кавычках shell не раскрывает
+export TUO_ROOT="$ROOT"      # playlist-dump сохраняет в ту же папку
 CONF="$HOME/.config/termux-downloads"
 COOKIES_DIR="$CONF/cookies"
 LOG="$CONF/history.log"       # приватно (в общей памяти его могли бы читать другие приложения)
@@ -82,6 +84,15 @@ normalize_url() {
     printf 'https://%s' "$1"; return 0
   fi
   return 1
+}
+
+# Ссылки из текста: со схемой (http/https/magnet), а если таких нет — «голые» домены
+# с путём («youtube.com/watch?v=…»). Без «/» доменом не считаем: «file.txt», «т.е.» — не ссылки.
+extract_urls() {
+  local found
+  found=$(printf '%s\n' "$1" | grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+')
+  [ -z "$found" ] && found=$(printf '%s\n' "$1" | grep -oiE '(^|[[:space:](])(www\.)?([a-z0-9-]+\.)+[a-z]{2,}/[^[:space:]<>"]*' | sed -E 's/^[[:space:](]+//')
+  [ -n "$found" ] && printf '%s\n' "$found"
 }
 
 # ---------- определение сервиса ----------
@@ -168,7 +179,6 @@ YTDLP_BASE=(--no-playlist --windows-filenames --no-mtime --embed-metadata
 JS_RT=(); SPOTDL_JS=()
 ensure_js() {
   [ ${#JS_RT[@]} -gt 0 ] && return 0
-  command -v deno >/dev/null 2>&1 && return 0
   ensure_pkg node nodejs-lts || { warn "Node.js не установлен — часть видео YouTube может не скачаться."; return 0; }
   command -v node >/dev/null 2>&1 || [ "$DRY" = 1 ] || return 0
   JS_RT=(--js-runtimes node)
@@ -285,35 +295,17 @@ dl_torrent() {
   run aria2c --dir="$DEST" --seed-time=0 --summary-interval=0 --follow-torrent=true "$1"
 }
 
-# Apple Music / Deezer / Tidal / Amazon / Yandex: DRM не взламываем, а находим тот же
-# трек/альбом через song.link и качаем его из Spotify (spotDL) или YouTube Music.
+# Apple Music / Deezer / Tidal / Amazon / Yandex: DRM не взламываем. playlist-dump берёт
+# список треков из открытых API (Deezer — треки/альбомы/плейлисты, iTunes — треки/альбомы)
+# и качает те же треки из Spotify (spotDL) или YouTube. Для Tidal/Amazon открытого API нет —
+# открывается страница song.link (публичный API song.link закрыт 31.07.2026).
 dl_convert() {
-  local json sp yt
-  say "Ищу этот трек/альбом на других площадках (song.link)…"
-  if [ -n "$TUO_SONGLINK_JSON" ]; then json="$TUO_SONGLINK_JSON"
-  else json=$(curl -sG --max-time 20 "https://api.song.link/v1-alpha.1/links" --data-urlencode "url=$1" 2>/dev/null)
+  local pld="$HOME/bin/playlist-dump"
+  if [ ! -x "$pld" ] && [ "$DRY" != 1 ]; then
+    err "playlist-dump не установлен. Обновите: cd ~/termux-downloader && git pull && bash install.sh"
+    return 1
   fi
-  read -r sp yt < <(printf '%s' "$json" | "$PY" -c '
-import json, sys
-try: d = json.load(sys.stdin).get("linksByPlatform", {})
-except Exception: d = {}
-u = lambda k: (d.get(k) or {}).get("url") or "-"
-yt = u("youtubeMusic")
-print(u("spotify"), yt if yt != "-" else u("youtube"))
-' 2>/dev/null)
-  if [ -n "$sp" ] && [ "$sp" != "-" ] && { command -v spotdl >/dev/null 2>&1 || [ "$DRY" = 1 ]; }; then
-    say "Найдено в Spotify: $sp"
-    dl_spotify "$sp" && return 0
-  fi
-  if [ -n "$yt" ] && [ "$yt" != "-" ]; then
-    say "Найдено на YouTube: $yt"
-    ytdlp_audio "$yt" && return 0
-  fi
-  err "Не удалось найти совпадение (song.link не нашёл или лимит 10 запросов/мин)."
-  case "$1" in
-    */playlist/*|*/pl.*) warn "Плейлисты song.link не поддерживает: перенесите плейлист в Spotify (tunemymusic.com / soundiiz.com) и поделитесь ссылкой Spotify." ;;
-  esac
-  return 1
+  run "$pld" link --service "$SERVICE" -y -- "$1"
 }
 
 dl_video() {
@@ -337,8 +329,8 @@ dl_generic() {
   warn "yt-dlp не справился — пробую gallery-dl…"
   gdl "$1" && return 0
   warn "Пробую скачать как обычный файл…"
-  local ct
-  ct=$(curl -sIL -A "Mozilla/5.0" -o /dev/null -w '%{content_type}' --max-time 20 "$1" 2>/dev/null)
+  local ct=application/octet-stream
+  [ "$DRY" = 1 ] || ct=$(curl -sIL -A "Mozilla/5.0" -o /dev/null -w '%{content_type}' --max-time 20 "$1" 2>/dev/null)
   case "$ct" in
     text/html*|"") err "По ссылке веб-страница, скачивать нечего."; return 1 ;;
   esac
@@ -354,7 +346,7 @@ media_scan() {
   command -v termux-media-scan >/dev/null 2>&1 || return 0
   timeout 30 termux-media-scan -r "$DEST" >/dev/null 2>&1
 }
-log_line() { printf '%s | %-13s | %-4s | %s\n' "$(date '+%F %T')" "$SERVICE" "$1" "$2" >> "$LOG" 2>/dev/null; }
+log_line() { [ "$DRY" = 1 ] && return 0; printf '%s | %-13s | %-4s | %s\n' "$(date '+%F %T')" "$SERVICE" "$1" "$2" >> "$LOG" 2>/dev/null; }
 
 hint_on_fail() {
   case "$SERVICE" in
@@ -390,7 +382,7 @@ process_url() {
   for f in "$COOKIES_DIR/$SLUG.txt" "$COOKIES_DIR/cookies.txt"; do
     [ -f "$f" ] && { COOK=(--cookies "$f"); break; }
   done
-  [ "$TYPE" = drm ] || mkdir -p "$DEST" 2>/dev/null
+  [ "$TYPE" = drm ] || [ "$DRY" = 1 ] || mkdir -p "$DEST" 2>/dev/null
 
   echo
   printf '%s\n' "${c_b}━━━ ${SERVICE} ━━━${c_0}"
@@ -410,7 +402,7 @@ process_url() {
   case "$TYPE" in
     spotify) dl_spotify "$url" ;;
     convert) dl_convert "$url" ;;
-    audio_convert) ytdlp_audio "$url" || { warn "Пробую найти трек через song.link…"; dl_convert "$url"; } ;;
+    audio_convert) ytdlp_audio "$url" || { warn "Пробую найти этот трек на других площадках…"; dl_convert "$url"; } ;;
     drm)     dl_drm ;;
     video)   dl_video "$url" ;;
     audio)   ytdlp_audio "$url" ;;
@@ -459,10 +451,12 @@ if [ "$DRY" != 1 ] && [ ! -d "$HOME/storage/shared" ]; then
   say "Нужен доступ к памяти телефона — разрешите его в появившемся окне."
   termux-setup-storage; sleep 4
 fi
-mkdir -p "$CONF" "$COOKIES_DIR" 2>/dev/null
-chmod 700 "$CONF" "$COOKIES_DIR" 2>/dev/null
-umask 077 2>/dev/null; touch "$LOG" 2>/dev/null; umask 022
-if ! mkdir -p "$ROOT" 2>/dev/null || [ ! -w "$ROOT" ]; then
+if [ "$DRY" != 1 ]; then   # --dry-run ничего не создаёт и не пишет
+  mkdir -p "$CONF" "$COOKIES_DIR" 2>/dev/null
+  chmod 700 "$CONF" "$COOKIES_DIR" 2>/dev/null
+  umask 077 2>/dev/null; touch "$LOG" 2>/dev/null; umask 022
+fi
+if [ "$DRY" != 1 ] && { ! mkdir -p "$ROOT" 2>/dev/null || [ ! -w "$ROOT" ]; }; then
   err "Нет доступа к памяти телефона: $ROOT"
   warn "Выполните termux-setup-storage и разрешите Termux доступ к файлам."
   [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
@@ -482,7 +476,7 @@ trap 'echo; warn "Прервано"; exit 130' INT TERM HUP
 if [ -f "$1" ]; then
   case "${1,,}" in
     *.torrent)
-      SERVICE="Torrents"; DEST="$ROOT/$SERVICE"; mkdir -p "$DEST"
+      SERVICE="Torrents"; DEST="$ROOT/$SERVICE"; [ "$DRY" = 1 ] || mkdir -p "$DEST"
       echo "Торрент-файл: $(basename "$1")"
       if confirm "Скачать?" 30; then dl_torrent "$1"; rc=$?; else warn "Отменено"; rc=2; fi; log_line "$([ $rc -eq 0 ] && echo OK || echo FAIL)" "$1"
       [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
@@ -503,8 +497,8 @@ while IFS= read -r u; do
   u=$(printf '%s' "$u" | sed -E 's/[.,;!»"'"'"']+$//')
   [ -n "$u" ] && [ -z "${SEEN[$u]}" ] || continue
   SEEN[$u]=1; URLS+=("$u")
-done < <(printf '%s\n' "$INPUT" | grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+')
-# без схемы: «youtube.com/watch?v=…» — normalize_url решит, ссылка это или нет
+done < <(extract_urls "$INPUT")
+# одно слово без схемы («youtu.be») — normalize_url решит, ссылка это или нет
 [ ${#URLS[@]} -eq 0 ] && URLS=("$INPUT")
 
 if [ "$DRY" != 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock; WAKE=1; fi
@@ -527,3 +521,4 @@ else
   [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
 fi
 echo
+[ $failc -eq 0 ]   # код возврата: 0 — без ошибок, 1 — были ошибки
