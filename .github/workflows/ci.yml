@@ -26,7 +26,7 @@ jobs:
         run: shellcheck -s bash install.sh bin/termux-url-opener bin/termux-file-editor tests/test_cli_dry_run.sh
 
       - name: Ruff
-        run: ruff check --select E,F,W --ignore E501,E402,E701,E702 bin/playlist-dump tests/test_playlist_dump.py
+        run: ruff check --select E,F,W --ignore E501,E402,E701,E702 bin/playlist-dump bin/termux-dl tests/test_playlist_dump.py tests/test_termux_dl.py
 
       - name: Python unit tests
         run: pytest -v

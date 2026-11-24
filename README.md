@@ -25,7 +25,7 @@ bash termux-downloader/install.sh
 ```
 
 Установщик ставит `ffmpeg`, `aria2`, `git`, `nodejs-lts`, `yt-dlp`, `gallery-dl`, `gdown`, копирует скрипты
-(`termux-url-opener`, `termux-file-editor`, `playlist-dump`) в `~/bin`
+(`termux-url-opener`, `termux-file-editor`, `playlist-dump`, `termux-dl`) в `~/bin`
 и добавляет `~/bin` в `PATH`.
 
 **Spotify** (необязательно, занимает много места при сборке):
@@ -120,10 +120,14 @@ playlist-dump export https://open.spotify.com/playlist/…    # → Termux Downl
 Cookies — это доступ к вашим аккаунтам: держите их только в этой папке (установщик закрывает её
 правами `700`), не кладите в общую память телефона и периодически перевыпускайте (выход/вход в аккаунт).
 
-## Обслуживание
+## Обслуживание и настройки
 
 ```bash
 termux-url-opener --update   # обновить yt-dlp, gallery-dl, gdown
+termux-url-opener --doctor   # проверить память, зависимости и права
+termux-url-opener --config   # показать настройки (~/.config/termux-downloads/config.json)
+termux-url-opener --config set video_quality 1080   # ask | best | 1080 | 720 | mp3
+termux-url-opener --config set audio_format m4a     # mp3 | m4a | opus
 termux-url-opener --help
 ```
 

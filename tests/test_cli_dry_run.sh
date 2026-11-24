@@ -46,6 +46,15 @@ out="$(TUO_DRY_RUN=1 "$OPENER" "https://www.deezer.com/album/302127")"
 assert_contains "$out" "━━━ Deezer ━━━" "Deezer detected"
 assert_contains "$out" "playlist-dump link" "playlist-dump link invoked"
 
+echo "==> termux-url-opener: config and doctor"
+"$OPENER" --config set video_quality 720 >/dev/null
+"$OPENER" --config set audio_format m4a >/dev/null
+out="$(TUO_DRY_RUN=1 "$OPENER" "https://youtu.be/dQw4w9WgXcQ")"
+assert_contains "$out" "res:720" "video_quality from config applied"
+"$OPENER" --config reset >/dev/null
+out="$(TUO_ROOT="$TMP/dl" "$OPENER" --doctor || true)"
+assert_contains "$out" "Диагностика termux-downloader" "--doctor runs"
+
 out="$(TUO_DRY_RUN=1 "$OPENER" "https://example.com/archive.zip")"
 assert_contains "$out" "━━━ Files ━━━" "direct file detected"
 assert_contains "$out" "[dry-run] curl" "curl invoked"

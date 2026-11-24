@@ -8,6 +8,8 @@
 #  Команды:
 #    termux-url-opener <ссылка или текст со ссылками>
 #    termux-url-opener --update   обновить yt-dlp, gallery-dl, gdown
+#    termux-url-opener --doctor   проверить память, зависимости и права
+#    termux-url-opener --config [show|get|set|reset]  настройки по умолчанию
 #    termux-url-opener --import файл.csv|txt    скачать плейлист из дампа
 #    termux-url-opener --export ссылка_spotify  выгрузить плейлист в CSV/TXT
 #    termux-url-opener --history [N]  последние N загрузок (журнал хранится приватно)
@@ -18,13 +20,37 @@
 #    ~/.config/termux-downloads/cookies/cookies.txt    общий для всех
 # =====================================================================
 
-ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+TDL="$HOME/bin/termux-dl"
+[ -x "$TDL" ] || TDL="$SCRIPT_DIR/termux-dl"
+[ -x "$TDL" ] || TDL="$(command -v termux-dl 2>/dev/null || true)"
+PLD="$HOME/bin/playlist-dump"
+[ -x "$PLD" ] || PLD="$SCRIPT_DIR/playlist-dump"
+
+CFG_ROOT=""; CFG_CHOICE=""; CFG_AUDIO_FMT="mp3"; CFG_THREADS=4; CFG_YES=0; CFG_MENU_TIMEOUT=15
+if [ -n "$TDL" ] && [ -x "$TDL" ]; then
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      CFG_ROOT)         CFG_ROOT="$_v" ;;
+      CFG_CHOICE)       CFG_CHOICE="$_v" ;;
+      CFG_AUDIO_FMT)    CFG_AUDIO_FMT="$_v" ;;
+      CFG_THREADS)      CFG_THREADS="$_v" ;;
+      CFG_YES)          CFG_YES="$_v" ;;
+      CFG_MENU_TIMEOUT) CFG_MENU_TIMEOUT="$_v" ;;
+    esac
+  done < <("$TDL" config env 2>/dev/null)
+fi
+
+ROOT="${TUO_ROOT:-${CFG_ROOT:-$HOME/storage/shared/Download/Termux Downloads}}"
 ROOT="${ROOT/#\~/$HOME}"     # TUO_ROOT="~/…" в кавычках shell не раскрывает
 export TUO_ROOT="$ROOT"      # playlist-dump сохраняет в ту же папку
 CONF="$HOME/.config/termux-downloads"
 COOKIES_DIR="$CONF/cookies"
 LOG="$CONF/history.log"       # приватно (в общей памяти его могли бы читать другие приложения)
-MENU_TIMEOUT=15              # секунд до автоматического выбора пункта 1
+MENU_TIMEOUT="${TUO_MENU_TIMEOUT:-$CFG_MENU_TIMEOUT}"
+AUDIO_FMT="${TUO_AUDIO_FMT:-$CFG_AUDIO_FMT}"
+THREADS="${TUO_THREADS:-$CFG_THREADS}"
+AUTO_YES="${TUO_YES:-$CFG_YES}"
 DRY="${TUO_DRY_RUN:-0}"      # 1 = только показать команды (для отладки)
 
 if command -v python3.13 >/dev/null 2>&1; then PY=python3.13; else PY=python; fi
@@ -58,7 +84,7 @@ ensure_pkg() {   # ensure_pkg <команда> <пакет termux>
 # пользователя: любое приложение может отправить ссылку в Termux через intent).
 confirm() {  # confirm <вопрос> <секунд>
   [ "$DRY" = 1 ] && return 0
-  [ "${TUO_YES:-0}" = 1 ] && return 0
+  [ "$AUTO_YES" = 1 ] && return 0
   local a
   read -r -t "$2" -p "$1 [Enter — да / n — нет; через $2 с — отмена]: " a || { echo; return 1; }
   case "${a,,}" in n*|н*) return 1 ;; esac
@@ -77,6 +103,10 @@ is_mass() {
 # Только http(s) и magnet; «голый» домен дополняется https://. Всё остальное отклоняется,
 # чтобы текст вида «--exec=…» не попал в yt-dlp/curl как опция.
 normalize_url() {
+  if [ -n "$TDL" ] && [ -x "$TDL" ]; then
+    "$TDL" normalize "$1"
+    return $?
+  fi
   case "$1" in
     http://*|https://*|magnet:\?*) printf '%s' "$1"; return 0 ;;
   esac
@@ -89,6 +119,10 @@ normalize_url() {
 # Ссылки из текста: со схемой (http/https/magnet), а если таких нет — «голые» домены
 # с путём («youtube.com/watch?v=…»). Без «/» доменом не считаем: «file.txt», «т.е.» — не ссылки.
 extract_urls() {
+  if [ -n "$TDL" ] && [ -x "$TDL" ]; then
+    "$TDL" extract "$1"
+    return $?
+  fi
   local found
   found=$(printf '%s\n' "$1" | grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+')
   [ -z "$found" ] && found=$(printf '%s\n' "$1" | grep -oiE '(^|[[:space:](])(www\.)?([a-z0-9-]+\.)+[a-z]{2,}/[^[:space:]<>"]*' | sed -E 's/^[[:space:](]+//')
@@ -100,9 +134,13 @@ extract_urls() {
 #   spotify | video (меню) | audio | social (yt-dlp → gallery-dl)
 #   gallery (gallery-dl → yt-dlp) | gdrive | git | torrent | generic
 detect_service() {
-  local url="$1" host
+  local url="$1" host _mass
+  if [ -n "$TDL" ] && [ -x "$TDL" ]; then
+    IFS=$'\t' read -r SERVICE TYPE _mass < <("$TDL" classify "$url")
+    [ -n "$SERVICE" ] && [ -n "$TYPE" ] && return 0
+  fi
   case "$url" in magnet:*) SERVICE="Torrents"; TYPE=torrent; return;; esac
-  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#[/?#].*##; s#:[0-9]+$##; s#^(www|m|mobile)\.##' | tr 'A-Z' 'a-z')
+  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#[/?#].*##; s#:[0-9]+$##; s#^(www|m|mobile)\.##' | tr '[:upper:]' '[:lower:]')
   case "$host" in
     open.spotify.com|spotify.com|*.spotify.com|spotify.link)  SERVICE="Spotify";       TYPE=spotify ;;
     music.youtube.com)                                         SERVICE="YouTube Music"; TYPE=audio ;;
@@ -198,7 +236,13 @@ ytdlp_video() {  # ytdlp_video <url> <сортировка форматов>
 ytdlp_audio() {
   ensure_pip yt-dlp "yt-dlp[default]" || return 1
   ensure_js
-  run yt-dlp "${YTDLP_BASE[@]}" "${JS_RT[@]}" "${COOK[@]}" -x --audio-format mp3 --audio-quality 0 \
+  local -a afmt
+  case "$AUDIO_FMT" in
+    m4a)  afmt=(-f "bestaudio[ext=m4a]/bestaudio/best" -x --audio-format m4a) ;;
+    opus) afmt=(-f "bestaudio[acodec=opus]/bestaudio/best" -x --audio-format opus) ;;
+    *)    afmt=(-x --audio-format mp3 --audio-quality 0) ;;
+  esac
+  run yt-dlp "${YTDLP_BASE[@]}" "${JS_RT[@]}" "${COOK[@]}" "${afmt[@]}" \
       --embed-thumbnail --convert-thumbnails jpg -o "$(out_tmpl)" -- "$1"
 }
 
@@ -208,15 +252,17 @@ gdl() {
 }
 
 video_menu() {
-  local c
-  echo
-  echo "  1) Видео — лучшее качество  (по умолчанию)"
-  echo "  2) Видео — до 1080p"
-  echo "  3) Видео — до 720p (экономит место)"
-  echo "  4) Только звук — MP3"
-  echo "  5) Отмена"
-  if [ "$DRY" = 1 ]; then c="${TUO_CHOICE:-1}"
-  else read -r -n 1 -t "$MENU_TIMEOUT" -p "Выбор [1-5] (через ${MENU_TIMEOUT} с — 1): " c; echo
+  local c="${TUO_CHOICE:-$CFG_CHOICE}"
+  if [ -z "$c" ]; then
+    echo
+    echo "  1) Видео — лучшее качество  (по умолчанию)"
+    echo "  2) Видео — до 1080p"
+    echo "  3) Видео — до 720p (экономит место)"
+    echo "  4) Только звук — ${AUDIO_FMT^^}"
+    echo "  5) Отмена"
+    if [ "$DRY" = 1 ]; then c=1
+    else read -r -n 1 -t "$MENU_TIMEOUT" -p "Выбор [1-5] (через ${MENU_TIMEOUT} с — 1): " c; echo
+    fi
   fi
   case "$c" in
     2) ytdlp_video "$1" "res:1080,ext:mp4:m4a" ;;
@@ -301,12 +347,11 @@ dl_torrent() {
 # и качает те же треки из Spotify (spotDL) или YouTube. Для Tidal/Amazon открытого API нет —
 # открывается страница song.link (публичный API song.link закрыт 31.07.2026).
 dl_convert() {
-  local pld="$HOME/bin/playlist-dump"
-  if [ ! -x "$pld" ] && [ "$DRY" != 1 ]; then
+  if [ ! -x "$PLD" ] && [ "$DRY" != 1 ]; then
     err "playlist-dump не установлен. Обновите: cd ~/termux-downloader && git pull && bash install.sh"
     return 1
   fi
-  run "$pld" link --service "$SERVICE" -y -- "$1"
+  run "$PLD" link --service "$SERVICE" --format "$AUDIO_FMT" --threads "$THREADS" -y -- "$1"
 }
 
 dl_video() {
@@ -377,7 +422,7 @@ process_url() {
   [ "$TYPE" = torrent ] && SERVICE="Torrents"
 
   DEST="$ROOT/$SERVICE"
-  SLUG=$(printf '%s' "$SERVICE" | tr 'A-Z ' 'a-z_')
+  SLUG=$(printf '%s' "$SERVICE" | tr '[:upper:] ' '[:lower:]_')
   COOK=()
   local f
   for f in "$COOKIES_DIR/$SLUG.txt" "$COOKIES_DIR/cookies.txt"; do
@@ -442,8 +487,14 @@ update_tools() {
 case "$1" in
   -h|--help) usage; exit 0 ;;
   --update)  update_tools; exit $? ;;
-  --import)  shift; exec "$HOME/bin/playlist-dump" "$@" ;;
-  --export)  shift; exec "$HOME/bin/playlist-dump" export "$@" ;;
+  --doctor)
+    [ -n "$TDL" ] && [ -x "$TDL" ] || { err "termux-dl не найден. Переустановите: bash install.sh"; exit 1; }
+    exec "$TDL" doctor ;;
+  --config)
+    [ -n "$TDL" ] && [ -x "$TDL" ] || { err "termux-dl не найден. Переустановите: bash install.sh"; exit 1; }
+    shift; exec "$TDL" config "$@" ;;
+  --import)  shift; exec "$PLD" "$@" ;;
+  --export)  shift; exec "$PLD" export "$@" ;;
   --history) [ -f "$LOG" ] && tail -n "${2:-30}" "$LOG" || echo "Журнал пуст."; exit 0 ;;
   "")        usage; exit 1 ;;
 esac

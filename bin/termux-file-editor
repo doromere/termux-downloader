@@ -8,10 +8,23 @@
 #  - любой другой файл  → Download/Termux Downloads/Shared Files/
 
 FILE="$1"
-ROOT="${TUO_ROOT:-$HOME/storage/shared/Download/Termux Downloads}"
-ROOT="${ROOT/#\~/$HOME}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 OPENER="$HOME/bin/termux-url-opener"
+[ -x "$OPENER" ] || OPENER="$SCRIPT_DIR/termux-url-opener"
 PLD="$HOME/bin/playlist-dump"
+[ -x "$PLD" ] || PLD="$SCRIPT_DIR/playlist-dump"
+TDL="$HOME/bin/termux-dl"
+[ -x "$TDL" ] || TDL="$SCRIPT_DIR/termux-dl"
+[ -x "$TDL" ] || TDL="$(command -v termux-dl 2>/dev/null || true)"
+
+CFG_ROOT=""
+if [ -n "$TDL" ] && [ -x "$TDL" ]; then
+  while IFS='=' read -r k v; do
+    [ "$k" = "CFG_ROOT" ] && CFG_ROOT="$v"
+  done < <("$TDL" config env 2>/dev/null)
+fi
+ROOT="${TUO_ROOT:-${CFG_ROOT:-$HOME/storage/shared/Download/Termux Downloads}}"
+ROOT="${ROOT/#\~/$HOME}"
 
 pause() { read -r -n 1 -s -t "${1:-10}" -p "Окно закроется через ${1:-10} с (или нажмите любую клавишу)…"; echo; }
 
@@ -31,11 +44,15 @@ case "${name,,}" in
 esac
 
 if [ "$is_text" = 1 ]; then
-  # Сначала ищем ссылки (со схемой, а если их нет — «голые» домены с путём: youtube.com/watch?v=…)
-  mapfile -t urls < <(grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+' "$FILE" | awk '!seen[$0]++' | head -n 200)
-  if [ ${#urls[@]} -eq 0 ]; then
-    mapfile -t urls < <(grep -oiE '(^|[[:space:](])(www\.)?([a-z0-9-]+\.)+[a-z]{2,}/[^[:space:]<>"]*' "$FILE" \
-                        | sed -E 's/^[[:space:](]+//' | awk '!seen[$0]++' | head -n 200)
+  # Сначала ищем ссылки (через termux-dl, с фолбэком на grep)
+  if [ -n "$TDL" ] && [ -x "$TDL" ]; then
+    mapfile -t urls < <("$TDL" extract --file "$FILE")
+  else
+    mapfile -t urls < <(grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+' "$FILE" | awk '!seen[$0]++' | head -n 200)
+    if [ ${#urls[@]} -eq 0 ]; then
+      mapfile -t urls < <(grep -oiE '(^|[[:space:](])(www\.)?([a-z0-9-]+\.)+[a-z]{2,}/[^[:space:]<>"]*' "$FILE" \
+                          | sed -E 's/^[[:space:](]+//' | awk '!seen[$0]++' | head -n 200)
+    fi
   fi
 
   lines=$(grep -c '[^[:space:]]' "$FILE")

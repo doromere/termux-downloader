@@ -41,7 +41,7 @@ CONF="$HOME/.config/termux-downloads"
 mkdir -p "$HOME/bin" "$CONF/cookies"
 chmod 700 "$CONF" "$CONF/cookies"           # cookies = доступ к аккаунтам
 chmod 600 "$CONF"/cookies/* 2>/dev/null || true
-for f in termux-url-opener termux-file-editor playlist-dump; do
+for f in termux-url-opener termux-file-editor playlist-dump termux-dl; do
   if [ -f "$SRC/bin/$f" ]; then
     cp "$SRC/bin/$f" "$HOME/bin/$f.new"
   else
@@ -72,9 +72,11 @@ fi
 # PATH для bash (оболочка Termux по умолчанию), а также zsh, если он настроен
 for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
   [ "$rc" = "$HOME/.bashrc" ] || [ -f "$rc" ] || continue
+  # shellcheck disable=SC2016
   grep -qs 'HOME/bin' "$rc" || echo 'export PATH="$HOME/bin:$PATH"' >> "$rc"
 done
 if [ -d "$HOME/.config/fish" ] && ! grep -qs 'HOME/bin' "$HOME/.config/fish/config.fish"; then
+  # shellcheck disable=SC2016
   echo 'fish_add_path -g $HOME/bin' >> "$HOME/.config/fish/config.fish"
 fi
 

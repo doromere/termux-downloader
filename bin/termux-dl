@@ -1,0 +1,473 @@
+#!/data/data/com.termux/files/usr/bin/sh
+''':'
+for p in python3.13 python3 python; do
+  command -v "$p" >/dev/null 2>&1 && exec "$p" "$0" "$@"
+done
+echo "Python не найден: pkg install python" >&2
+exit 1
+'''
+"""termux-dl — общее Python-ядро для termux-downloader (URL, конфиг, диагностика)."""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import urllib.parse
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "termux-downloads"
+DEFAULT_DOWNLOAD_DIR = "~/storage/shared/Download/Termux Downloads"
+
+DEFAULT_CONFIG = {
+    "download_dir": DEFAULT_DOWNLOAD_DIR,
+    "video_quality": "ask",   # ask | best | 1080 | 720 | mp3
+    "audio_format": "mp3",    # mp3 | m4a | opus
+    "threads": 4,             # 1..8
+    "auto_confirm": False,
+    "menu_timeout": 15,       # 0..120
+}
+
+VALID_VIDEO_QUALITY = ("ask", "best", "1080", "720", "mp3")
+VALID_AUDIO_FORMAT = ("mp3", "m4a", "opus")
+
+URL_SCHEME_RE = re.compile(r"(https?://|magnet:\?)[^\s<>\"]+")
+BARE_DOMAIN_RE = re.compile(
+    r"(?:^|[\s(])((?:www\.)?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/[^\s<>\"]*)"
+)
+NORMALIZE_BARE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(/[^\s]*)?$"
+)
+TRAILING_PUNCT_RE = re.compile(r"[.,;!»\"'’…]+$")
+
+DIRECT_EXTS = {
+    "mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp",
+    "mp3", "m4a", "aac", "flac", "wav", "ogg", "opus",
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "svg",
+    "pdf", "epub", "fb2", "djvu", "mobi",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "txt", "csv",
+    "zip", "rar", "7z", "tar", "gz", "tgz", "xz", "bz2",
+    "apk", "apks", "xapk", "exe", "msi", "iso", "deb",
+}
+
+DRM_DOMAINS = {
+    "netflix.com", "disneyplus.com", "primevideo.com", "max.com", "hbomax.com",
+    "tv.apple.com", "kinopoisk.ru", "hd.kinopoisk.ru", "ivi.ru", "okko.tv",
+    "start.ru", "wink.ru", "more.tv", "kion.ru",
+}
+
+
+def config_path() -> Path:
+    env = os.environ.get("TUO_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".config" / "termux-downloads" / "config.json"
+
+
+def _coerce_config(raw: dict) -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if not isinstance(raw, dict):
+        return cfg
+    if isinstance(raw.get("download_dir"), str) and raw["download_dir"].strip():
+        cfg["download_dir"] = raw["download_dir"].replace("\r", "").replace("\n", "").strip()
+    vq = str(raw.get("video_quality", "")).lower()
+    if vq in VALID_VIDEO_QUALITY:
+        cfg["video_quality"] = vq
+    af = str(raw.get("audio_format", "")).lower()
+    if af in VALID_AUDIO_FORMAT:
+        cfg["audio_format"] = af
+    try:
+        th = int(raw.get("threads", cfg["threads"]))
+        cfg["threads"] = max(1, min(8, th))
+    except (TypeError, ValueError):
+        pass
+    if isinstance(raw.get("auto_confirm"), bool):
+        cfg["auto_confirm"] = raw["auto_confirm"]
+    try:
+        mt = int(raw.get("menu_timeout", cfg["menu_timeout"]))
+        cfg["menu_timeout"] = max(1, min(120, mt))
+    except (TypeError, ValueError):
+        pass
+    return cfg
+
+
+def load_config() -> dict:
+    path = config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return _coerce_config(data)
+    except Exception:  # noqa: BLE001
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict) -> Path:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    clean = _coerce_config(cfg)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    tmp.replace(path)
+    return path
+
+
+def set_config_value(key: str, value: str) -> dict:
+    if key not in DEFAULT_CONFIG:
+        raise ValueError(f"Неизвестный параметр: {key}")
+    cfg = load_config()
+    if key == "download_dir":
+        if not value.strip():
+            raise ValueError("Путь не может быть пустым")
+        cfg[key] = value.strip()
+    elif key == "video_quality":
+        v = value.strip().lower()
+        if v not in VALID_VIDEO_QUALITY:
+            raise ValueError(f"video_quality должен быть одним из: {', '.join(VALID_VIDEO_QUALITY)}")
+        cfg[key] = v
+    elif key == "audio_format":
+        v = value.strip().lower()
+        if v not in VALID_AUDIO_FORMAT:
+            raise ValueError(f"audio_format должен быть одним из: {', '.join(VALID_AUDIO_FORMAT)}")
+        cfg[key] = v
+    elif key == "threads":
+        v = int(value)
+        if not 1 <= v <= 8:
+            raise ValueError("threads должен быть от 1 до 8")
+        cfg[key] = v
+    elif key == "menu_timeout":
+        v = int(value)
+        if not 1 <= v <= 120:
+            raise ValueError("menu_timeout должен быть от 1 до 120")
+        cfg[key] = v
+    elif key == "auto_confirm":
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on", "да"):
+            cfg[key] = True
+        elif v in ("0", "false", "no", "off", "нет"):
+            cfg[key] = False
+        else:
+            raise ValueError("auto_confirm должен быть true/false (1/0)")
+    save_config(cfg)
+    return cfg
+
+
+def clean_url_token(url: str) -> str:
+    u = TRAILING_PUNCT_RE.sub("", url.strip())
+    while u.endswith(")") and u.count(")") > u.count("("):
+        u = u[:-1]
+    return TRAILING_PUNCT_RE.sub("", u)
+
+
+def normalize_url(url: str):
+    u = clean_url_token(url)
+    if u.startswith(("http://", "https://", "magnet:?")):
+        return u
+    if NORMALIZE_BARE_RE.match(u):
+        return f"https://{u}"
+    return None
+
+
+def extract_urls(text: str, limit: int = 200) -> list[str]:
+    found = [m.group(0) for m in URL_SCHEME_RE.finditer(text or "")]
+    if not found:
+        found = [m.group(1) for m in BARE_DOMAIN_RE.finditer(text or "")]
+    out, seen = [], set()
+    for raw in found:
+        u = clean_url_token(raw)
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def is_direct_file(url: str) -> bool:
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    if "." not in path.rsplit("/", 1)[-1]:
+        return False
+    ext = path.rsplit(".", 1)[-1]
+    return ext in DIRECT_EXTS
+
+
+def is_mass(url: str) -> bool:
+    low = url.lower()
+    markers = (
+        "youtube.com/playlist", "youtube.com/@", "youtube.com/channel/",
+        "youtube.com/c/", "youtube.com/user/",
+        "open.spotify.com/artist/",
+    )
+    if any(m in low for m in markers):
+        return True
+    return bool(re.search(r"open\.spotify\.com/[^/]+/artist/", low))
+
+
+def _match_host(host: str, *domains: str) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def detect_service(url: str) -> tuple[str, str]:
+    if url.startswith("magnet:"):
+        return "Torrents", "torrent"
+    host = urllib.parse.urlparse(url).netloc.lower()
+    host = re.sub(r":\d+$", "", host)
+    host = re.sub(r"^(www|m|mobile)\.", "", host)
+
+    if host == "spotify.link" or _match_host(host, "spotify.com"):
+        return "Spotify", "spotify"
+    if host == "music.youtube.com":
+        return "YouTube Music", "audio"
+    if host in ("youtu.be", "youtube-nocookie.com") or _match_host(host, "youtube.com"):
+        return "YouTube", "video"
+    if host in ("fxtwitter.com", "vxtwitter.com", "fixupx.com") or _match_host(
+        host, "x.com", "twitter.com", "twimg.com"
+    ):
+        return "Twitter", "gallery"
+    if _match_host(host, "instagram.com", "cdninstagram.com"):
+        return "Instagram", "gallery"
+    if _match_host(host, "threads.net", "threads.com"):
+        return "Threads", "gallery"
+    if _match_host(host, "tiktok.com"):
+        return "TikTok", "social"
+    if host == "vk.cc" or _match_host(host, "vk.com", "vk.ru", "vkvideo.ru", "userapi.com"):
+        return "VK", "video"
+    if _match_host(host, "ok.ru"):
+        return "OK", "video"
+    if _match_host(host, "rutube.ru"):
+        return "Rutube", "video"
+    if host == "zen.yandex.ru" or _match_host(host, "dzen.ru"):
+        return "Dzen", "video"
+    if host.startswith("music.yandex."):
+        return "Yandex Music", "audio_convert"
+    if host in ("music.apple.com", "itunes.apple.com", "geo.music.apple.com"):
+        return "Apple Music", "convert"
+    if host in ("deezer.page.link", "dzr.page.link") or _match_host(host, "deezer.com"):
+        return "Deezer", "convert"
+    if _match_host(host, "tidal.com"):
+        return "Tidal", "convert"
+    if host.startswith("music.amazon."):
+        return "Amazon Music", "convert"
+    if _match_host(host, *DRM_DOMAINS):
+        return "DRM", "drm"
+    if _match_host(host, "reddit.com", "redd.it"):
+        return "Reddit", "social"
+    if host == "pin.it" or re.match(r"^(?:[^.]+\.)?pinterest\.", host) or _match_host(host, "pinimg.com"):
+        return "Pinterest", "gallery"
+    if host in ("fb.watch", "fb.com") or _match_host(host, "facebook.com"):
+        return "Facebook", "video"
+    if _match_host(host, "twitch.tv"):
+        return "Twitch", "video"
+    if _match_host(host, "vimeo.com"):
+        return "Vimeo", "video"
+    if host == "dai.ly" or _match_host(host, "dailymotion.com"):
+        return "Dailymotion", "video"
+    if host in ("bilibili.tv", "b23.tv") or _match_host(host, "bilibili.com"):
+        return "Bilibili", "video"
+    if _match_host(host, "coub.com"):
+        return "Coub", "video"
+    if _match_host(host, "soundcloud.com"):
+        return "SoundCloud", "audio"
+    if _match_host(host, "bandcamp.com"):
+        return "Bandcamp", "audio"
+    if _match_host(host, "mixcloud.com"):
+        return "Mixcloud", "audio"
+    if host in ("t.me", "telegram.me"):
+        return "Telegram", "social"
+    if _match_host(host, "bsky.app"):
+        return "Bluesky", "gallery"
+    if _match_host(host, "tumblr.com"):
+        return "Tumblr", "gallery"
+    if _match_host(host, "imgur.com"):
+        return "Imgur", "gallery"
+    if _match_host(host, "pixiv.net"):
+        return "Pixiv", "gallery"
+    if _match_host(host, "deviantart.com"):
+        return "DeviantArt", "gallery"
+    if _match_host(host, "artstation.com"):
+        return "ArtStation", "gallery"
+    if host in ("drive.google.com", "docs.google.com"):
+        return "Google Drive", "gdrive"
+    if host in ("github.com", "raw.githubusercontent.com", "objects.githubusercontent.com"):
+        return "GitHub", "git"
+    return "Other", "generic"
+
+
+def run_doctor() -> int:
+    c_ok, c_err, c_warn, c_b, c_0 = "\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[0m"
+    cfg = load_config()
+    root = Path(os.environ.get("TUO_ROOT") or cfg["download_dir"]).expanduser()
+    conf_dir = config_path().parent
+    cookies_dir = conf_dir / "cookies"
+
+    print(f"{c_b}━━━ Диагностика termux-downloader ━━━{c_0}")
+    print(f"Python:  {sys.version.split()[0]} ({sys.executable})")
+    print(f"Конфиг:  {config_path()}")
+
+    critical_ok = True
+    # 1. Память телефона
+    storage_link = Path.home() / "storage" / "shared"
+    if storage_link.exists() or os.environ.get("TUO_ROOT"):
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / f".doctor_{os.getpid()}.tmp"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            print(f"{c_ok}✔ Папка загрузок доступна для записи:{c_0} {root}")
+        except OSError as e:
+            print(f"{c_err}✘ Нет записи в {root}:{c_0} {e}")
+            critical_ok = False
+    else:
+        print(f"{c_err}✘ Нет доступа к памяти (~/storage/shared не найден) — выполните termux-setup-storage{c_0}")
+        critical_ok = False
+
+    # 2. Права на cookies/config
+    if os.name == "posix" and cookies_dir.exists():
+        mode = stat.S_IMODE(cookies_dir.stat().st_mode)
+        if mode & 0o077:
+            print(f"{c_warn}! Слишком открытые права на {cookies_dir} ({oct(mode)}), рекомендуется 0700{c_0}")
+        else:
+            print(f"{c_ok}✔ Права на папку cookies безопасны ({oct(mode)}){c_0}")
+
+    # 3. Утилиты
+    required = [
+        ("yt-dlp", "видео/аудио (pip install -U 'yt-dlp[default]')"),
+        ("ffmpeg", "конвертация и склейка (pkg install ffmpeg)"),
+        ("curl", "прямые ссылки и короткие URL (pkg install curl)"),
+        ("node", "JS-рантайм для YouTube (pkg install nodejs-lts)"),
+    ]
+    optional = [
+        ("gallery-dl", "фото и посты соцсетей (pip install -U gallery-dl)"),
+        ("gdown", "Google Drive (pip install -U gdown)"),
+        ("aria2c", "торренты и magnet (pkg install aria2)"),
+        ("git", "репозитории GitHub (pkg install git)"),
+        ("spotdl", "Spotify (см. README)"),
+        ("termux-notification", "уведомления (Termux:API + pkg install termux-api)"),
+        ("termux-media-scan", "индексация в галерее (Termux:API)"),
+    ]
+    print("\nОсновные компоненты:")
+    for cmd, desc in required:
+        path = shutil.which(cmd)
+        if path:
+            print(f"  {c_ok}✔{c_0} {cmd:<14} {path}")
+        else:
+            print(f"  {c_err}✘{c_0} {cmd:<14} не найден — {desc}")
+            critical_ok = False
+
+    print("\nДополнительные компоненты:")
+    for cmd, desc in optional:
+        path = shutil.which(cmd)
+        if path:
+            print(f"  {c_ok}✔{c_0} {cmd:<20} {path}")
+        else:
+            print(f"  {c_warn}•{c_0} {cmd:<20} не установлен — {desc}")
+
+    print()
+    if critical_ok:
+        print(f"{c_ok}✔ Готово к работе.{c_0}")
+        return 0
+    print(f"{c_err}✘ Обнаружены критические проблемы.{c_0}")
+    return 1
+
+
+def _cmd_config(args) -> int:
+    action = args.action or "show"
+    if action == "show":
+        cfg = load_config()
+        print(f"Файл: {config_path()}")
+        print(json.dumps(cfg, ensure_ascii=False, indent=2))
+        return 0
+    if action == "env":
+        cfg = load_config()
+        q_map = {"ask": "", "best": "1", "1080": "2", "720": "3", "mp3": "4"}
+        print(f"CFG_ROOT={cfg['download_dir']}")
+        print(f"CFG_CHOICE={q_map.get(cfg['video_quality'], '')}")
+        print(f"CFG_AUDIO_FMT={cfg['audio_format']}")
+        print(f"CFG_THREADS={int(cfg['threads'])}")
+        print(f"CFG_YES={'1' if cfg['auto_confirm'] else '0'}")
+        print(f"CFG_MENU_TIMEOUT={int(cfg['menu_timeout'])}")
+        return 0
+    if action == "reset":
+        p = save_config(dict(DEFAULT_CONFIG))
+        print(f"✔ Конфиг сброшен: {p}")
+        return 0
+    if action == "get":
+        if not args.key:
+            print("Укажите ключ", file=sys.stderr)
+            return 1
+        cfg = load_config()
+        if args.key not in cfg:
+            print(f"Неизвестный параметр: {args.key}", file=sys.stderr)
+            return 1
+        print(cfg[args.key])
+        return 0
+    if action == "set":
+        if not args.key or args.value is None:
+            print("Использование: termux-dl config set <ключ> <значение>", file=sys.stderr)
+            return 1
+        try:
+            cfg = set_config_value(args.key, args.value)
+        except ValueError as e:
+            print(f"✘ {e}", file=sys.stderr)
+            return 1
+        print(f"✔ {args.key} = {cfg[args.key]}")
+        return 0
+    print(f"Неизвестное действие: {action}", file=sys.stderr)
+    return 1
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="termux-dl")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pe = sub.add_parser("extract")
+    pe.add_argument("--file", type=Path)
+    pe.add_argument("text", nargs="*")
+
+    pn = sub.add_parser("normalize")
+    pn.add_argument("url")
+
+    pc = sub.add_parser("classify")
+    pc.add_argument("url")
+
+    pg = sub.add_parser("config")
+    pg.add_argument("action", nargs="?", choices=["show", "get", "set", "reset", "env"])
+    pg.add_argument("key", nargs="?")
+    pg.add_argument("value", nargs="?")
+
+    sub.add_parser("doctor")
+
+    args = p.parse_args(argv)
+    if args.cmd == "extract":
+        text = args.file.read_text(encoding="utf-8", errors="replace") if args.file else " ".join(args.text)
+        for u in extract_urls(text):
+            print(u)
+        return 0
+    if args.cmd == "normalize":
+        u = normalize_url(args.url)
+        if not u:
+            return 1
+        print(u)
+        return 0
+    if args.cmd == "classify":
+        svc, kind = detect_service(args.url)
+        mass = "1" if is_mass(args.url) else "0"
+        print(f"{svc}\t{kind}\t{mass}")
+        return 0
+    if args.cmd == "config":
+        return _cmd_config(args)
+    if args.cmd == "doctor":
+        return run_doctor()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
