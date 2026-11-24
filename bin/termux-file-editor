@@ -31,27 +31,32 @@ case "${name,,}" in
 esac
 
 if [ "$is_text" = 1 ]; then
-  # Список треков: 3+ строк и нет «чужих» ссылок (ссылки на треки Spotify допустимы)
-  lines=$(grep -c '[^[:space:]]' "$FILE")
-  foreign=$(grep -oE 'https?://[^[:space:]]+' "$FILE" | grep -vc 'open\.spotify\.com/\(intl-[a-z-]*/\)\{0,1\}track/')
-  if [ "$lines" -ge 3 ] && [ "$foreign" -eq 0 ]; then
-    run_playlist_dump
-  fi
-
-  # Текст со ссылками: передаём только сами ссылки (без дублей) — весь текст одним
-  # аргументом может превысить лимит ядра (128 КБ на аргумент)
-  # (если ссылок со схемой нет — «голые» домены с путём: youtube.com/watch?v=…, как в termux-url-opener)
+  # Сначала ищем ссылки (со схемой, а если их нет — «голые» домены с путём: youtube.com/watch?v=…)
   mapfile -t urls < <(grep -oE '(https?://|magnet:\?)[^[:space:]<>"]+' "$FILE" | awk '!seen[$0]++' | head -n 200)
   if [ ${#urls[@]} -eq 0 ]; then
     mapfile -t urls < <(grep -oiE '(^|[[:space:](])(www\.)?([a-z0-9-]+\.)+[a-z]{2,}/[^[:space:]<>"]*' "$FILE" \
                         | sed -E 's/^[[:space:](]+//' | awk '!seen[$0]++' | head -n 200)
   fi
+
+  lines=$(grep -c '[^[:space:]]' "$FILE")
   if [ ${#urls[@]} -gt 0 ]; then
+    # Список треков Spotify (3+ строк и все ссылки — треки Spotify) → playlist-dump;
+    # иначе передаём найденные ссылки в termux-url-opener
+    foreign=$(printf '%s\n' "${urls[@]}" | grep -vcE '^(https?://)?open\.spotify\.com/(intl-[a-z-]+/)?track/')
+    if [ "$lines" -ge 3 ] && [ "$foreign" -eq 0 ]; then
+      run_playlist_dump
+    fi
     # исходный текст удаляем только после успешной загрузки — при ошибке он остаётся в ~/downloads
     "$OPENER" "${urls[@]}"
     rc=$?
     [ $rc -eq 0 ] && rm -f "$FILE"
     exit $rc
+  fi
+
+  # Текст без ссылок: считаем списком треков, только если 3+ непустых строк и есть строки «Исполнитель - Название» / spotify:track:
+  track_lines=$(grep -cE '([[:space:]][-–—][[:space:]]|^spotify:track:)' "$FILE")
+  if [ "$lines" -ge 3 ] && [ $((track_lines * 2)) -ge "$lines" ]; then
+    run_playlist_dump
   fi
 fi
 

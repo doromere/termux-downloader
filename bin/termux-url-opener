@@ -163,7 +163,8 @@ resolve_short() {
     case "$1" in
       *://t.co/*|*://vk.cc/*|*://bit.ly/*|*://spotify.link/*|*://link.deezer.com/*|*://deezer.page.link/*|*://dzr.page.link/*|*://pin.it/*|*://goo.gl/*|*://tinyurl.com/*|\
       *://clck.ru/*|*://is.gd/*|*://cutt.ly/*|*://on.soundcloud.com/*|*://redd.it/*|*reddit.com/r/*/s/*)
-        r=$(curl -sL -A "Mozilla/5.0" -o /dev/null -w '%{url_effective}' --max-time 15 "$1" 2>/dev/null)
+        r=$(curl -sL --proto =http,https --proto-redir =http,https -A "Mozilla/5.0" \
+            -o /dev/null -w '%{url_effective}' --max-time 15 -- "$1" 2>/dev/null)
         [ -n "$r" ] && { printf '%s' "$r"; return; } ;;
     esac
   fi
@@ -246,15 +247,15 @@ dl_spotify() {
     */artist/*)   tmpl='{album-artist}/{album}/{artists} - {title}.{output-ext}' ;;
   esac
   ensure_js
-  run spotdl download "$1" --output "$DEST/$tmpl" --threads 2 --max-retries 5 "${SPOTDL_JS[@]}"
+  run spotdl download --output "$DEST/$tmpl" --threads 2 --max-retries 5 "${SPOTDL_JS[@]}" -- "$1"
 }
 
 dl_direct() {
   ensure_pkg curl curl || return 1
   case "${1%%[?#]*}" in
-    */) run curl -L --fail --retry 3 -A "Mozilla/5.0" --no-clobber \
-            -o "$DEST/download_$(date +%Y%m%d-%H%M%S)" "$1" ;;
-    *)  run curl -L --fail --retry 3 -A "Mozilla/5.0" --no-clobber --output-dir "$DEST" -OJ "$1" ;;
+    */) run curl -L --proto =http,https --proto-redir =http,https --fail --retry 3 -A "Mozilla/5.0" --no-clobber \
+            -o "$DEST/download_$(date +%Y%m%d-%H%M%S)" -- "$1" ;;
+    *)  run curl -L --proto =http,https --proto-redir =http,https --fail --retry 3 -A "Mozilla/5.0" --no-clobber --output-dir "$DEST" -OJ -- "$1" ;;
   esac
 }
 
@@ -285,14 +286,14 @@ dl_git() {
 dl_gdrive() {
   ensure_pip gdown gdown || return 1
   case "$1" in
-    */folders/*) run gdown --folder "$1" -O "$DEST" ;;
-    *)           run gdown "$1" -O "$DEST/" ;;
+    */folders/*) run gdown --folder -O "$DEST" -- "$1" ;;
+    *)           run gdown -O "$DEST/" -- "$1" ;;
   esac
 }
 
 dl_torrent() {
   ensure_pkg aria2c aria2 || return 1
-  run aria2c --dir="$DEST" --seed-time=0 --summary-interval=0 --follow-torrent=true "$1"
+  run aria2c --dir="$DEST" --seed-time=0 --summary-interval=0 --follow-torrent=true -- "$1"
 }
 
 # Apple Music / Deezer / Tidal / Amazon / Yandex: DRM не взламываем. playlist-dump берёт
@@ -330,7 +331,7 @@ dl_generic() {
   gdl "$1" && return 0
   warn "Пробую скачать как обычный файл…"
   local ct=application/octet-stream
-  [ "$DRY" = 1 ] || ct=$(curl -sIL -A "Mozilla/5.0" -o /dev/null -w '%{content_type}' --max-time 20 "$1" 2>/dev/null)
+  [ "$DRY" = 1 ] || ct=$(curl -sIL --proto =http,https --proto-redir =http,https -A "Mozilla/5.0" -o /dev/null -w '%{content_type}' --max-time 20 -- "$1" 2>/dev/null)
   case "$ct" in
     text/html*|"") err "По ссылке веб-страница, скачивать нечего."; return 1 ;;
   esac
@@ -478,7 +479,12 @@ if [ -f "$1" ]; then
     *.torrent)
       SERVICE="Torrents"; DEST="$ROOT/$SERVICE"; [ "$DRY" = 1 ] || mkdir -p "$DEST"
       echo "Торрент-файл: $(basename "$1")"
-      if confirm "Скачать?" 30; then dl_torrent "$1"; rc=$?; else warn "Отменено"; rc=2; fi; log_line "$([ $rc -eq 0 ] && echo OK || echo FAIL)" "$1"
+      if confirm "Скачать?" 30; then dl_torrent "$1"; rc=$?; else warn "Отменено"; rc=2; fi
+      case $rc in
+        0) log_line OK "$1" ;;
+        2) log_line SKIP "$1" ;;
+        *) log_line FAIL "$1" ;;
+      esac
       [ "$DRY" = 1 ] || read -r -n 1 -s -p "Нажмите любую клавишу для выхода…"
       exit $rc ;;
   esac
@@ -503,15 +509,18 @@ done < <(extract_urls "$INPUT")
 
 if [ "$DRY" != 1 ] && command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock; WAKE=1; fi
 
-total=${#URLS[@]}; okc=0; failc=0
+total=${#URLS[@]}; okc=0; failc=0; skipc=0
 for u in "${URLS[@]}"; do
-  process_url "$u"; case $? in 0) okc=$((okc+1));; 2) ;; *) failc=$((failc+1));; esac
+  process_url "$u"; case $? in 0) okc=$((okc+1));; 2) skipc=$((skipc+1));; *) failc=$((failc+1));; esac
 done
 
 cleanup
 
 echo
-if [ $failc -eq 0 ]; then
+if [ $failc -eq 0 ] && [ $okc -eq 0 ] && [ $skipc -gt 0 ]; then
+  warn "Отменено: $skipc из $total"
+  [ "$DRY" = 1 ] || read -r -n 1 -s -t 10 -p "Окно закроется через 10 с (или нажмите любую клавишу)…"
+elif [ $failc -eq 0 ]; then
   ok "Скачано: $okc из $total → Download/Termux Downloads"
   notify "Загрузка завершена" "$okc из $total → Download/Termux Downloads"
   [ "$DRY" = 1 ] || read -r -n 1 -s -t 10 -p "Окно закроется через 10 с (или нажмите любую клавишу)…"

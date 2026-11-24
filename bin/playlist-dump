@@ -380,32 +380,28 @@ def resolve(rows, sp: Spotify, cache: dict, save_cache):
         if re.match(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$", isrc):  # точное совпадение записи
             for item in sp.search(f"isrc:{isrc}") or []:
                 if ((item.get("external_ids") or {}).get("isrc") or "").upper() == isrc or score(item, row):
-                    meta = song_from_item(item)
-                    if meta:
-                        cache.setdefault("meta", {})[item_id(item)] = meta
-                    return row, item_id(item)
+                    return row, item_id(item), song_from_item(item)
         items = sp.search(build_query(row))
         if items is None:
-            return row, None
+            return row, None, None
         best, best_score = None, 0.0
         for item in items[:8]:
             s = score(item, row)
             if s > best_score:
                 best, best_score = item, s
-        if best:
-            meta = song_from_item(best)
-            if meta:
-                cache.setdefault("meta", {})[item_id(best)] = meta
-        return row, (item_id(best) if best else "")
+        meta = song_from_item(best) if best else None
+        return row, (item_id(best) if best else ""), meta
 
     with ThreadPoolExecutor(max_workers=4) as ex:
-        for row, sid in ex.map(work, todo):
+        for row, sid, meta in ex.map(work, todo):
             done += 1
             label = row_label(row)
             if sid is None:
                 print(f"  [{done}/{len(todo)}] {C_WARN}? ошибка поиска{C_0} {label}", flush=True)
                 continue
             cache[row_key(row)] = sid
+            if sid and meta:
+                cache.setdefault("meta", {})[sid] = meta
             mark = f"{C_OK}✔{C_0}" if sid else f"{C_WARN}→ YouTube{C_0}"
             print(f"  [{done}/{len(todo)}] {mark} {label}", flush=True)
             if done % 25 == 0:
@@ -632,22 +628,27 @@ def run_youtube(rows, dest: Path, opts, dry: bool, positions=None, total=0):
             print("[dry-run]", " ".join(cmd))
             return row, label, None
         # код 101 = «достигнут --max-downloads» — это успех, поэтому смотрим на результат, а не на код
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         for line in reversed((res.stdout or "").splitlines()):
             f = Path(line.strip())
             if line.strip() and f.is_file():
-                return row, label, f.name
-        return row, label, (target.name if target.exists() else None)
+                return row, label, f.name, ""
+        if target.exists():
+            return row, label, target.name, ""
+        err_lines = [ln.strip() for ln in (res.stderr or "").splitlines() if ln.strip()]
+        reason = re.sub(r"^ERROR:\s*", "", err_lines[-1])[:120] if err_lines else ""
+        return row, label, None, reason
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for row, label, fname in ex.map(work, rows):
+        for row, label, fname, reason in ex.map(work, rows):
             done += 1
             if fname:
                 got[row_key(row)] = fname
                 print(f"  [{done}/{count}] {C_OK}✔{C_0} {label}", flush=True)
             elif not dry:
                 failed.append(label)
-                print(f"  [{done}/{count}] {C_ERR}✘{C_0} {label}", flush=True)
+                suffix = f" ({reason})" if reason else ""
+                print(f"  [{done}/{count}] {C_ERR}✘{C_0} {label}{suffix}", flush=True)
     if failed:
         try:
             with open(dest / ".not-found.txt", "a", encoding="utf-8") as f:
@@ -1011,9 +1012,19 @@ class LinkError(Exception):
     pass
 
 
+class _HttpOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not re.match(r"^https?://", newurl or "", re.I):
+            raise LinkError(f"Небезопасный редирект: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTP_OPENER = urllib.request.build_opener(_HttpOnlyRedirect)
+
+
 def http_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 — только https-адреса API ниже
+    with _HTTP_OPENER.open(req, timeout=20) as r:  # noqa: S310 — только https-адреса API ниже
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
@@ -1021,8 +1032,9 @@ def final_url(url):
     """Короткие ссылки Deezer (link.deezer.com/s/…, deezer.page.link) → полная ссылка."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=15) as r:  # noqa: S310
-            return r.geturl()
+        with _HTTP_OPENER.open(req, timeout=15) as r:  # noqa: S310
+            res = r.geturl()
+            return res if re.match(r"^https?://", res or "", re.I) else url
     except Exception:  # noqa: BLE001
         return url
 
@@ -1097,6 +1109,8 @@ def resolve_apple(url):
                     key=lambda x: (x.get("discNumber") or 1, x.get("trackNumber") or 0))
         if not tr:
             raise LinkError("Альбом не найден в каталоге Apple (iTunes Search API)")
+        if len(tr) >= 200:
+            warn("iTunes API возвращает не более 200 треков альбома — список может быть неполным.")
         name = f"{coll.get('artistName') or tr[0].get('artistName', '')} - {coll.get('collectionName') or tr[0].get('collectionName', '')}"
         return name.strip(" -"), [mk_row(t["trackName"], t.get("artistName"), t.get("collectionName")) for t in tr]
     raise LinkError(None)
@@ -1187,8 +1201,12 @@ def export(urls, fmt):
     except ImportError:
         err("Для выгрузки нужен spotDL.")
         return 1
-    SpotifyClient.init(client_id=SPOTIFY_OPTIONS["client_id"],
-                       client_secret=SPOTIFY_OPTIONS["client_secret"])
+    try:
+        SpotifyClient.init(client_id=SPOTIFY_OPTIONS["client_id"],
+                           client_secret=SPOTIFY_OPTIONS["client_secret"])
+    except Exception as e:  # noqa: BLE001
+        err(f"Не удалось подключиться к Spotify: {e}")
+        return 1
     out_dir = ROOT / "Playlists"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)

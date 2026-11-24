@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install lint and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          python -m pip install --upgrade pip ruff pytest
+
+      - name: ShellCheck
+        run: shellcheck -s bash install.sh bin/termux-url-opener bin/termux-file-editor tests/test_cli_dry_run.sh
+
+      - name: Ruff
+        run: ruff check --select E,F,W --ignore E501,E402,E701,E702 bin/playlist-dump tests/test_playlist_dump.py
+
+      - name: Python unit tests
+        run: pytest -v
+
+      - name: CLI dry-run and routing tests
+        run: bash tests/test_cli_dry_run.sh
