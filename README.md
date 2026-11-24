@@ -45,13 +45,15 @@ curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scrip
 | Музыка | Spotify | spotDL, альбомы/плейлисты — в подпапки |
 | Видео (меню качества) | YouTube, VK, OK, Rutube, Dzen, Facebook, Twitch, Vimeo, Dailymotion, Bilibili, Coub | yt-dlp: лучшее / 1080p / 720p / только MP3 |
 | Аудио | YouTube Music, SoundCloud, Bandcamp, Mixcloud, Yandex Music | yt-dlp → MP3 с обложкой и тегами |
-| Музыка с DRM | Apple Music, Deezer, Tidal, Amazon Music (и Yandex Music, если yt-dlp не справился) | DRM не взламывается: трек/альбом находится через song.link и качается из Spotify (spotDL) или YouTube Music |
+| Музыка с DRM | Deezer (треки, альбомы, плейлисты), Apple Music (треки, альбомы) | DRM не взламывается: список треков берётся из открытых API Deezer / iTunes, а сами треки качаются из Spotify (spotDL) или YouTube — через `playlist-dump link` |
+| | Tidal, Amazon Music (и Yandex Music, если yt-dlp не справился) | открытого API нет: открывается страница song.link — выберите там Spotify / YouTube Music и поделитесь той ссылкой в Termux |
 | Фото + видео | Twitter/X, Instagram, Threads, Pinterest, Bluesky, Tumblr, Imgur, Pixiv, DeviantArt, ArtStation | gallery-dl → yt-dlp |
 | Соцсети | TikTok, Reddit, Telegram (публичные посты) | yt-dlp → gallery-dl |
 | Файлы | Google Drive, GitHub, magnet / .torrent, прямые ссылки | gdown, git, aria2c, curl |
 | Остальное | любые сайты | yt-dlp → gallery-dl → curl |
 
-Короткие ссылки (`t.co`, `vk.cc`, `spotify.link`, `pin.it`, `reddit.com/…/s/…`) раскрываются автоматически.
+Ссылки без `https://` («youtube.com/watch?v=…») тоже распознаются — если в тексте нет ссылок со схемой
+и после домена есть путь. Короткие ссылки (`t.co`, `vk.cc`, `spotify.link`, `pin.it`, `reddit.com/…/s/…`) раскрываются автоматически.
 
 **Подтверждения.** Торренты, прямые файлы, GitHub, «прочие сайты», а также каналы / плейлисты YouTube
 и страницы исполнителей Spotify скачиваются только после подтверждения (Enter). Если ничего не нажать
@@ -65,7 +67,7 @@ Spotify без Premium и без API-ключа: выгрузите их в CSV/
 
 ```bash
 playlist-dump                          # выбрать файл из папки Download
-playlist-dump "~/storage/shared/Download/Liked Songs.csv"
+playlist-dump "~/storage/shared/Download/Liked Songs.csv"   # «~» в кавычках тоже работает
 playlist-dump файл.csv --numbered      # нумеровать треки по порядку
 playlist-dump файл.csv --check         # что распознано и сколько уже скачано
 playlist-dump файл.csv --format m4a    # без перекодирования в MP3 — в разы быстрее
@@ -86,7 +88,16 @@ playlist-dump файл.csv --threads 2     # меньше параллельны
 5. Плейлист `<имя>.m3u8` собирается в порядке дампа из всех скачанных треков.
 
 Результат: `Download/Termux Downloads/Spotify/<имя плейлиста>/`. Прерванную загрузку достаточно
-запустить снова — скачанное будет пропущено за секунды.
+запустить снова — скачанное будет пропущено за секунды. Код возврата: `0` — всё скачано,
+`1` — были ошибки (часть треков не найдена, нет доступа к папке…), `2` — отменено.
+Одну и ту же папку нельзя качать из двух окон Termux одновременно — второе окно сообщит об этом.
+
+**Ссылки Deezer / Apple Music** (то же самое, что делает «Поделиться → Termux»):
+
+```bash
+playlist-dump link https://www.deezer.com/album/302127     # → Termux Downloads/Deezer/<альбом>/
+playlist-dump link "https://music.apple.com/…/album/…?i=…"   # один трек → Termux Downloads/Apple Music/
+```
 
 **Выгрузка** публичного плейлиста/альбома Spotify в CSV (формат TuneMyMusic) и TXT:
 
@@ -129,12 +140,15 @@ YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno
 
 - Видеостриминги с DRM (Netflix, Disney+, Prime Video, Max, Apple TV, Кинопоиск, ivi, Okko, Wink и т.п.)
   не скачиваются — обход DRM незаконен. Используйте офлайн-загрузку в официальных приложениях.
-- Плейлисты Apple Music / Deezer / Tidal song.link не поддерживает: перенесите плейлист в Spotify
-  (tunemymusic.com, soundiiz.com) и поделитесь ссылкой Spotify. Лимит song.link — 10 запросов в минуту.
+- Публичный API song.link (Odesli) закрыт 31.07.2026, поэтому Tidal и Amazon Music автоматически не
+  конвертируются (открывается страница song.link). Плейлисты Apple Music / Tidal / Amazon без входа в аккаунт
+  не получить: перенесите плейлист в Spotify (tunemymusic.com, soundiiz.com) и поделитесь ссылкой Spotify
+  или выгрузите его в CSV и поделитесь файлом. Плейлисты Deezer (публичные) работают напрямую.
 - Не поддерживаются подкасты Spotify, музыка VK, закрытые чаты Telegram.
 - «Любимые треки» Spotify по ссылке не скачать (нужен вход через API, только Premium) — выгрузите их
   в CSV на tunemymusic.com и поделитесь файлом (см. `playlist-dump`).
 - Запасной поиск на YouTube (`ytsearch`) может найти не ту версию трека (кавер, live, ремикс):
   берётся первый результат не длиннее 15 минут. Результат стоит проверить.
 - Ссылка, присланная в Termux, может прийти из любого приложения: поэтому принимаются только
-  `http(s)://` и `magnet:`, а «массовые» загрузки требуют подтверждения.
+  `http(s)://`, `magnet:` и «голые» домены (им дописывается `https://`); всё, что похоже на опцию
+  (`--exec=…`), отклоняется, а «массовые» загрузки требуют подтверждения.
