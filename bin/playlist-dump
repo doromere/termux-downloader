@@ -456,19 +456,25 @@ def first_artist(artists):
     return tokens(re.split(r"[,;&]", artists or "")[0])
 
 
-def row_sig(row, cache):
-    """(подпись названия, токены первого исполнителя) — для сравнения с именами файлов."""
-    sid = row["sid"] or cache.get(row_key(row))
-    m = (cache.get("meta") or {}).get(sid) if sid else None
+def compact(s):
+    """Только буквы и цифры: «AC/DC» и «ACDC», «Intro/Chamber» и «IntroChamber», «S**t» и «St»
+    совпадают. spotDL просто выбрасывает из имён файлов символы /?\\*|<>, а мы — заменяем на «_»."""
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    s = "".join(c for c in s if not unicodedata.combining(c)).replace("ё", "е")
+    return re.sub(r"[\W_]+", "", s)
+
+
+def row_parts(row, cache):
+    """(название, исполнители) строки дампа — для сравнения с именами файлов."""
     if row["title"]:
-        return title_sig(row["title"]), first_artist(row["artist"])
+        return row["title"], row["artist"]
     if row["query"]:
         parts = DASH_RE.split(row["query"], maxsplit=1)
-        if len(parts) == 2:
-            return title_sig(parts[1]), first_artist(parts[0])
-        return title_sig(row["query"]), set()
+        return (parts[1], parts[0]) if len(parts) == 2 else (row["query"], "")
+    sid = row["sid"] or cache.get(row_key(row))
+    m = (cache.get("meta") or {}).get(sid) if sid else None
     if m:
-        return title_sig(m["name"]), first_artist(m["artist"])
+        return m.get("name") or "", m.get("artist") or ""
     return None
 
 
@@ -476,7 +482,7 @@ class Existing:
     """Аудиофайлы в папке плейлиста: один проход по папке, поиск за O(1)."""
 
     def __init__(self, dest: Path):
-        self.names, self.index = set(), {}
+        self.names, self.index, self.cindex = set(), {}, {}
         try:
             files = [p for p in dest.iterdir() if p.suffix.lower() in AUDIO_EXT and p.is_file()]
         except OSError:
@@ -486,18 +492,32 @@ class Existing:
             parts = DASH_RE.split(strip_num(p.stem), maxsplit=1)
             artist, title = (parts[0], parts[1]) if len(parts) == 2 else ("", parts[0])
             self.index.setdefault(title_sig(title), []).append((tokens(artist), p.name))
+            self.cindex.setdefault(compact(FEAT_RE.sub(" ", title)), []).append((compact(artist), p.name))
 
     def find(self, row, cache):
         known = (cache.get("files") or {}).get(row_key(row))
         if known and known in self.names:
             return known
-        sig = row_sig(row, cache)
-        if not sig or not sig[0]:
+        parts = row_parts(row, cache)
+        if not parts:
             return None
-        t, a = sig
-        for file_artists, name in self.index.get(t, []):
-            # название совпадает полностью (ремикс/live — другое название), исполнитель — входит
-            if not a or not file_artists or a <= file_artists or cover(a, file_artists) >= 0.5:
+        title, artists = parts
+        t, a = title_sig(title), first_artist(artists)
+        if t:
+            for file_artists, name in self.index.get(t, []):
+                # название совпадает полностью (ремикс/live — другое название), исполнитель — входит
+                if not a or not file_artists or a <= file_artists or cover(a, file_artists) >= 0.5:
+                    return name
+        # запасной вариант — сравнение «только буквы и цифры»: спецсимволы в названии/исполнителе
+        # (AC/DC, Skumf*k) или название из одних «стоп-слов» (System Of A Down — «X»)
+        ct = compact(FEAT_RE.sub(" ", title))
+        ca = compact(re.split(r"[,;&]", artists or "")[0])
+        if not ct:
+            return None
+        for file_ca, name in self.cindex.get(ct, []):
+            if ca and file_ca and (ca in file_ca or file_ca in ca):
+                return name
+            if len(ct) >= 4 and (not ca or not file_ca):  # короткое название без исполнителя — не угадываем
                 return name
         return None
 
@@ -542,6 +562,9 @@ def run_spotdl(entries, dest: Path, opts, dry: bool):
         cmd += ["--yt-dlp-args", " ".join(js)]
     full = sum(1 for e in entries if e.get("name"))
     say(f"spotDL: скачиваю {len(entries)} трек(ов), до {min(opts.threads, len(entries))} одновременно…")
+    if js:
+        print("  (предупреждение spotDL «Some YouTube downloads require Deno» можно игнорировать —"
+              " используется Node.js)")
     if full < len(entries):
         print(f"  (для {len(entries) - full} трек(ов) spotDL сам догрузит данные из Spotify — это дольше)")
     if dry:
@@ -586,7 +609,7 @@ def run_youtube(rows, dest: Path, opts, dry: bool, positions=None, total=0):
     else:
         audio = ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     workers = max(1, min(opts.threads, 4, len(rows)))
-    say(f"YouTube: скачиваю {len(rows)} трек(ов), которых нет в Spotify, {workers} одновременно…")
+    say(f"YouTube: скачиваю {len(rows)} трек(ов), {workers} одновременно…")
     count, done, got, failed = len(rows), 0, {}, []
     width = len(str(total or count))
 
@@ -841,6 +864,16 @@ def process_group(g: Group, sp, args, m3u=True):
                     pass
         if entries:
             run_spotdl(entries, dest, args, args.dry_run)
+            if not args.dry_run:
+                # что spotDL не смог (LookupError «No results found», ошибка YT-DLP) — вторая попытка:
+                # прямой поиск на YouTube, он находит другие видео
+                g.refresh()
+                planned = {row_key(r) for r in yt_rows}
+                retry = [with_title(r, cache) for r in g.missing if row_key(r) not in planned]
+                retry = [r for r in retry if r["title"] or r["query"]]
+                if retry:
+                    say(f"spotDL не скачал {len(retry)} трек(ов) — ищу их на YouTube напрямую…")
+                    yt_rows = yt_rows + retry
         got = run_youtube(yt_rows, dest, args, args.dry_run, positions, len(g.rows))
 
         if args.dry_run:
@@ -858,6 +891,17 @@ def process_group(g: Group, sp, args, m3u=True):
     finally:
         if fh:
             fh.close()
+
+
+def with_title(row, cache):
+    """Строка только со Spotify ID → копия с названием из кэша метаданных (для поиска на YouTube)."""
+    if row["title"] or row["query"]:
+        return row
+    sid = row["sid"] or cache.get(row_key(row))
+    m = (cache.get("meta") or {}).get(sid) if sid else None
+    if not m:
+        return row
+    return {**row, "title": m.get("name") or "", "artist": ", ".join(m.get("artists") or [m.get("artist") or ""])}
 
 
 def fetch_groups(groups, rows, args, state, m3u=True):
