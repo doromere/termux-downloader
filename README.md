@@ -128,10 +128,12 @@ termux-url-opener --doctor   # проверить память, зависимо
 termux-url-opener --config   # показать настройки (~/.config/termux-downloads/config.json)
 termux-url-opener --config set video_quality 1080   # ask | best | 1080 | 720 | mp3
 termux-url-opener --config set audio_format m4a     # mp3 | m4a | opus
+termux-url-opener --config set ui auto              # auto | cli | gui (Termux:GUI)
 termux-url-opener --help
 ```
 
-Уведомления о завершении: установите приложение **Termux:API** и `pkg install termux-api`.
+Уведомления о завершении и прогрессе: установите приложение **Termux:API** и `pkg install termux-api`.
+Опциональный графический выбор качества/подтверждения: установите **Termux:GUI** (F-Droid) и `pip install termuxgui` (иначе автоматически используется меню в терминале).
 
 ## «Some YouTube downloads require Deno»
 

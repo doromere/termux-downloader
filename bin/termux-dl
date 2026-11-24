@@ -6,19 +6,24 @@ done
 echo "Python не найден: pkg install python" >&2
 exit 1
 '''
-"""termux-dl — общее Python-ядро для termux-downloader (URL, конфиг, диагностика)."""
+"""termux-dl — общее Python-ядро для termux-downloader (URL, конфиг, загрузки, диагностика, UI)."""
 
 import argparse
 import json
 import os
 import re
+import select
+import shlex
 import shutil
+import signal
 import stat
+import subprocess
 import sys
+import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "termux-downloads"
 DEFAULT_DOWNLOAD_DIR = "~/storage/shared/Download/Termux Downloads"
 
 DEFAULT_CONFIG = {
@@ -27,11 +32,13 @@ DEFAULT_CONFIG = {
     "audio_format": "mp3",    # mp3 | m4a | opus
     "threads": 4,             # 1..8
     "auto_confirm": False,
-    "menu_timeout": 15,       # 0..120
+    "menu_timeout": 15,       # 1..120
+    "ui": "auto",             # auto | cli | gui
 }
 
 VALID_VIDEO_QUALITY = ("ask", "best", "1080", "720", "mp3")
 VALID_AUDIO_FORMAT = ("mp3", "m4a", "opus")
+VALID_UI_MODES = ("auto", "cli", "gui")
 
 URL_SCHEME_RE = re.compile(r"(https?://|magnet:\?)[^\s<>\"]+")
 BARE_DOMAIN_RE = re.compile(
@@ -58,12 +65,59 @@ DRM_DOMAINS = {
     "start.ru", "wink.ru", "more.tv", "kion.ru",
 }
 
+SHORT_DOMAINS = (
+    "t.co", "vk.cc", "bit.ly", "spotify.link", "link.deezer.com",
+    "deezer.page.link", "dzr.page.link", "pin.it", "goo.gl", "tinyurl.com",
+    "clck.ru", "is.gd", "cutt.ly", "on.soundcloud.com", "redd.it",
+)
 
+YTDLP_CLI_BASE = [
+    "--no-playlist", "--windows-filenames", "--no-mtime", "--embed-metadata",
+    "--retries", "10", "--fragment-retries", "10", "--concurrent-fragments", "4",
+]
+
+C_OK, C_ERR, C_INF, C_WARN, C_B, C_0 = (
+    "\033[32m", "\033[31m", "\033[36m", "\033[33m", "\033[1m", "\033[0m"
+)
+UA = "Mozilla/5.0 (Linux; Android 14) termux-downloader"
+
+
+def say(msg: str):
+    print(f"{C_INF}{msg}{C_0}", flush=True)
+
+
+def ok(msg: str):
+    print(f"{C_OK}✔ {msg}{C_0}", flush=True)
+
+
+def warn(msg: str):
+    print(f"{C_WARN}! {msg}{C_0}", flush=True)
+
+
+def err(msg: str):
+    print(f"{C_ERR}✘ {msg}{C_0}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Конфигурация
+# --------------------------------------------------------------------------
 def config_path() -> Path:
     env = os.environ.get("TUO_CONFIG")
     if env:
         return Path(env).expanduser()
     return Path.home() / ".config" / "termux-downloads" / "config.json"
+
+
+def conf_dir() -> Path:
+    return config_path().parent
+
+
+def cookies_dir() -> Path:
+    return conf_dir() / "cookies"
+
+
+def history_path() -> Path:
+    return conf_dir() / "history.log"
 
 
 def _coerce_config(raw: dict) -> dict:
@@ -90,6 +144,9 @@ def _coerce_config(raw: dict) -> dict:
         cfg["menu_timeout"] = max(1, min(120, mt))
     except (TypeError, ValueError):
         pass
+    ui = str(raw.get("ui", "")).lower()
+    if ui in VALID_UI_MODES:
+        cfg["ui"] = ui
     return cfg
 
 
@@ -127,7 +184,7 @@ def set_config_value(key: str, value: str) -> dict:
     if key == "download_dir":
         if not value.strip():
             raise ValueError("Путь не может быть пустым")
-        cfg[key] = value.strip()
+        cfg[key] = value.replace("\r", "").replace("\n", "").strip()
     elif key == "video_quality":
         v = value.strip().lower()
         if v not in VALID_VIDEO_QUALITY:
@@ -137,6 +194,11 @@ def set_config_value(key: str, value: str) -> dict:
         v = value.strip().lower()
         if v not in VALID_AUDIO_FORMAT:
             raise ValueError(f"audio_format должен быть одним из: {', '.join(VALID_AUDIO_FORMAT)}")
+        cfg[key] = v
+    elif key == "ui":
+        v = value.strip().lower()
+        if v not in VALID_UI_MODES:
+            raise ValueError(f"ui должен быть одним из: {', '.join(VALID_UI_MODES)}")
         cfg[key] = v
     elif key == "threads":
         v = int(value)
@@ -160,6 +222,9 @@ def set_config_value(key: str, value: str) -> dict:
     return cfg
 
 
+# --------------------------------------------------------------------------
+# Разбор и классификация URL
+# --------------------------------------------------------------------------
 def clean_url_token(url: str) -> str:
     u = TRAILING_PUNCT_RE.sub("", url.strip())
     while u.endswith(")") and u.count(")") > u.count("("):
@@ -195,8 +260,7 @@ def is_direct_file(url: str) -> bool:
     path = url.split("?", 1)[0].split("#", 1)[0].lower()
     if "." not in path.rsplit("/", 1)[-1]:
         return False
-    ext = path.rsplit(".", 1)[-1]
-    return ext in DIRECT_EXTS
+    return path.rsplit(".", 1)[-1] in DIRECT_EXTS
 
 
 def is_mass(url: str) -> bool:
@@ -301,19 +365,729 @@ def detect_service(url: str) -> tuple[str, str]:
     return "Other", "generic"
 
 
-def run_doctor() -> int:
-    c_ok, c_err, c_warn, c_b, c_0 = "\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[0m"
-    cfg = load_config()
-    root = Path(os.environ.get("TUO_ROOT") or cfg["download_dir"]).expanduser()
-    conf_dir = config_path().parent
-    cookies_dir = conf_dir / "cookies"
+# --------------------------------------------------------------------------
+# Сетевые помощники и системные вызовы Termux
+# --------------------------------------------------------------------------
+class _HttpOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not re.match(r"^https?://", newurl or "", re.I):
+            raise ValueError(f"Unsafe redirect: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    print(f"{c_b}━━━ Диагностика termux-downloader ━━━{c_0}")
+
+_HTTP_OPENER = urllib.request.build_opener(_HttpOnlyRedirect)
+
+
+def resolve_short(url: str, dry: bool = False) -> str:
+    if dry:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    is_short = host in SHORT_DOMAINS or ("reddit.com" in host and "/s/" in parsed.path)
+    if not is_short:
+        return url
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _HTTP_OPENER.open(req, timeout=15) as r:
+            res = r.geturl()
+            if re.match(r"^https?://", res or "", re.I):
+                return res
+    except Exception:  # noqa: BLE001
+        pass
+    return url
+
+
+def probe_content_type(url: str, dry: bool = False) -> str:
+    if dry:
+        return "application/octet-stream"
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}, method=method)
+            with _HTTP_OPENER.open(req, timeout=20) as r:
+                return (r.headers.get("Content-Type") or "").lower()
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def notify(title: str, content: str, notif_id: str | None = None, ongoing: bool = False):
+    exe = shutil.which("termux-notification")
+    if not exe:
+        return
+    cmd = [exe, "--title", title, "--content", content]
+    if notif_id:
+        cmd += ["--id", notif_id]
+    if ongoing:
+        cmd += ["--ongoing"]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dismiss_notification(notif_id: str):
+    exe = shutil.which("termux-notification-remove")
+    if not exe:
+        return
+    try:
+        subprocess.run([exe, notif_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def media_scan(dest: Path):
+    exe = shutil.which("termux-media-scan")
+    if not exe:
+        return
+    try:
+        subprocess.run([exe, "-r", str(dest)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def wake_lock(enable: bool):
+    exe = shutil.which("termux-wake-lock" if enable else "termux-wake-unlock")
+    if not exe:
+        return
+    try:
+        subprocess.run([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def log_line(service: str, status: str, url: str, dry: bool = False):
+    if dry:
+        return
+    p = history_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(p.parent, 0o700)
+    except OSError:
+        pass
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{stamp} | {service:<13} | {status:<4} | {url}\n"
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Интерактивный ввод + опциональный Termux:GUI
+# --------------------------------------------------------------------------
+def _read_line_timeout(prompt: str, timeout: int):
+    """Возвращает строку (без \\n) или None при таймауте/EOF."""
+    print(prompt, end="", flush=True)
+    if os.name == "posix" and sys.stdin.isatty():
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not rlist:
+            print()
+            return None
+        line = sys.stdin.readline()
+        return None if line == "" else line.rstrip("\r\n")
+    line = sys.stdin.readline()
+    return None if line == "" else line.rstrip("\r\n")
+
+
+def _gui_enabled(ui_mode: str) -> bool:
+    if ui_mode == "cli":
+        return False
+    try:
+        import termuxgui  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def gui_video_menu(service: str, audio_fmt: str) -> str | None:
+    """Окно выбора качества в Termux:GUI. None — перейти на CLI-меню."""
+    try:
+        import termuxgui as tg  # type: ignore
+    except ImportError:
+        return None
+    try:
+        with tg.Connection() as conn:
+            a = tg.Activity(conn, dialog=True)
+            layout = tg.LinearLayout(a)
+            tg.TextView(a, f"{service}: выберите качество", layout)
+            choices = [
+                ("1", "Видео — лучшее качество"),
+                ("2", "Видео — до 1080p"),
+                ("3", "Видео — до 720p"),
+                ("4", f"Только звук — {audio_fmt.upper()}"),
+                ("5", "Отмена"),
+            ]
+            btns = {tg.Button(a, label, layout).id: code for code, label in choices}
+            for ev in conn.events():
+                if ev.type == tg.Event.click and ev.value.get("id") in btns:
+                    return btns[ev.value["id"]]
+                if ev.type == tg.Event.destroy:
+                    return "5"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def gui_confirm(title: str, question: str) -> bool | None:
+    """Диалог подтверждения в Termux:GUI. None — перейти на CLI."""
+    try:
+        import termuxgui as tg  # type: ignore
+    except ImportError:
+        return None
+    try:
+        with tg.Connection() as conn:
+            a = tg.Activity(conn, dialog=True)
+            layout = tg.LinearLayout(a)
+            tg.TextView(a, f"{title}\n{question}", layout)
+            row = tg.LinearLayout(a, layout, vertical=False)
+            btn_yes = tg.Button(a, "Скачать", row)
+            btn_no = tg.Button(a, "Отмена", row)
+            for ev in conn.events():
+                if ev.type == tg.Event.click:
+                    if ev.value.get("id") == btn_yes.id:
+                        return True
+                    if ev.value.get("id") == btn_no.id:
+                        return False
+                if ev.type == tg.Event.destroy:
+                    return False
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------
+# Зависимости и запуск загрузчиков
+# --------------------------------------------------------------------------
+def run_cmd(cmd: list[str], dry: bool = False) -> int:
+    if dry:
+        print("[dry-run]", " ".join(shlex.quote(str(x)) for x in cmd), flush=True)
+        return 0
+    return subprocess.call([str(x) for x in cmd])
+
+
+def ensure_pip(cmd_name: str, pkg_name: str, dry: bool = False) -> bool:
+    if shutil.which(cmd_name) or dry:
+        return True
+    say(f"Устанавливаю {pkg_name}…")
+    rc = subprocess.call([sys.executable, "-m", "pip", "install", "-U", pkg_name])
+    return rc == 0 and bool(shutil.which(cmd_name))
+
+
+def ensure_pkg(cmd_name: str, pkg_name: str, dry: bool = False) -> bool:
+    if shutil.which(cmd_name) or dry:
+        return True
+    if not shutil.which("pkg"):
+        err(f"Команда {cmd_name} не найдена (установите пакет {pkg_name}).")
+        return False
+    say(f"Устанавливаю {pkg_name}…")
+    rc = subprocess.call(["pkg", "install", "-y", pkg_name])
+    return rc == 0 and bool(shutil.which(cmd_name))
+
+
+def ensure_js(dry: bool = False) -> list[str]:
+    if shutil.which("node"):
+        return ["--js-runtimes", "node"]
+    if dry:
+        return []
+    if shutil.which("pkg"):
+        say("Устанавливаю nodejs-lts…")
+        subprocess.call(["pkg", "install", "-y", "nodejs-lts"])
+        if shutil.which("node"):
+            return ["--js-runtimes", "node"]
+    warn("Node.js не установлен — часть видео YouTube может не скачаться.")
+    return []
+
+
+def _format_bytes(num) -> str:
+    if not num:
+        return "?"
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num < 1024:
+            return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
+        num /= 1024
+    return f"{num:.1f} TiB"
+
+
+def _make_progress_hook(service: str):
+    state = {"last_tty": 0.0, "last_notif": 0.0, "last_pct": -1}
+    is_tty = sys.stdout.isatty()
+    notif_id = "termux-dl-progress"
+
+    def hook(d: dict):
+        status = d.get("status")
+        now = time.monotonic()
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            pct = (done * 100.0 / total) if total > 0 else 0.0
+            speed = _format_bytes(d.get("speed")) + "/s" if d.get("speed") else "…"
+            eta = d.get("eta")
+            eta_s = f"{int(eta // 60):02d}:{int(eta % 60):02d}" if isinstance(eta, (int, float)) else "--:--"
+            if is_tty and now - state["last_tty"] >= 0.25:
+                filled = int(pct // 5)
+                bar = "█" * filled + "░" * (20 - filled)
+                print(f"\r  [{bar}] {pct:5.1f}% • {speed} • ETA {eta_s}  ", end="", flush=True)
+                state["last_tty"] = now
+            elif not is_tty:
+                step = int(pct // 25) * 25
+                if total > 0 and step > state["last_pct"]:
+                    state["last_pct"] = step
+                    print(f"  {step}% ({_format_bytes(done)} / {_format_bytes(total)})", flush=True)
+            if now - state["last_notif"] >= 2.0:
+                notify(f"{service}: загрузка", f"{pct:.0f}% • {speed} • ETA {eta_s}", notif_id=notif_id, ongoing=True)
+                state["last_notif"] = now
+        elif status == "finished":
+            if is_tty:
+                print("\r  [████████████████████] 100.0% — обработка…            ", flush=True)
+            dismiss_notification(notif_id)
+
+    return hook
+
+
+def _run_ytdlp_api(url: str, dest: Path, cookie_file: Path | None, fmt_sort: str | None, audio_fmt: str | None, service: str) -> int:
+    try:
+        import yt_dlp  # type: ignore
+    except ImportError:
+        return -1
+
+    ydl_opts = {
+        "noplaylist": True,
+        "windowsfilenames": True,
+        "updatetime": False,
+        "retries": 10,
+        "fragment_retries": 10,
+        "concurrent_fragment_downloads": 4,
+        "outtmpl": str(dest / "%(playlist_title|)s" / "%(title).150B [%(id)s].%(ext)s"),
+        "quiet": True,
+        "no_warnings": False,
+        "noprogress": True,
+        "progress_hooks": [_make_progress_hook(service)],
+    }
+    if shutil.which("node"):
+        ydl_opts["js_runtimes"] = {"node": {}}
+    if cookie_file:
+        ydl_opts["cookiefile"] = str(cookie_file)
+
+    if audio_fmt:
+        if audio_fmt == "m4a":
+            ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+        elif audio_fmt == "opus":
+            ydl_opts["format"] = "bestaudio[acodec=opus]/bestaudio/best"
+        else:
+            ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["writethumbnail"] = True
+        ydl_opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": audio_fmt, "preferredquality": "0"},
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
+            {"key": "EmbedThumbnail"},
+            {"key": "FFmpegMetadata"},
+        ]
+    else:
+        if fmt_sort:
+            ydl_opts["format_sort"] = [s.strip() for s in fmt_sort.split(",")]
+        ydl_opts["merge_output_format"] = "mp4"
+        ydl_opts["postprocessors"] = [{"key": "FFmpegMetadata"}]
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            rc = ydl.download([url])
+        return 0 if rc == 0 else 1
+    except Exception as e:  # noqa: BLE001
+        dismiss_notification("termux-dl-progress")
+        err(f"yt-dlp: {e}")
+        return 1
+
+
+def ytdlp_video(url: str, dest: Path, cookie_file: Path | None, fmt_sort: str, service: str, dry: bool) -> int:
+    if not ensure_pip("yt-dlp", "yt-dlp[default]", dry=dry):
+        return 1
+    js = ensure_js(dry=dry)
+    if not dry:
+        rc = _run_ytdlp_api(url, dest, cookie_file, fmt_sort, None, service)
+        if rc != -1:
+            return rc
+    cook = ["--cookies", str(cookie_file)] if cookie_file else []
+    tmpl = f"{dest}/%(playlist_title|)s/%(title).150B [%(id)s].%(ext)s"
+    cmd = ["yt-dlp", *YTDLP_CLI_BASE, *js, *cook, "-S", fmt_sort, "--merge-output-format", "mp4", "-o", tmpl, "--", url]
+    return run_cmd(cmd, dry=dry)
+
+
+def ytdlp_audio(url: str, dest: Path, cookie_file: Path | None, audio_fmt: str, service: str, dry: bool) -> int:
+    if not ensure_pip("yt-dlp", "yt-dlp[default]", dry=dry):
+        return 1
+    js = ensure_js(dry=dry)
+    if not dry:
+        rc = _run_ytdlp_api(url, dest, cookie_file, None, audio_fmt, service)
+        if rc != -1:
+            return rc
+    cook = ["--cookies", str(cookie_file)] if cookie_file else []
+    if audio_fmt == "m4a":
+        afmt = ["-f", "bestaudio[ext=m4a]/bestaudio/best", "-x", "--audio-format", "m4a"]
+    elif audio_fmt == "opus":
+        afmt = ["-f", "bestaudio[acodec=opus]/bestaudio/best", "-x", "--audio-format", "opus"]
+    else:
+        afmt = ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+    tmpl = f"{dest}/%(playlist_title|)s/%(title).150B [%(id)s].%(ext)s"
+    cmd = ["yt-dlp", *YTDLP_CLI_BASE, *js, *cook, *afmt, "--embed-thumbnail", "--convert-thumbnails", "jpg", "-o", tmpl, "--", url]
+    return run_cmd(cmd, dry=dry)
+
+
+def gdl(url: str, dest: Path, cookie_file: Path | None, dry: bool) -> int:
+    if not ensure_pip("gallery-dl", "gallery-dl", dry=dry):
+        return 1
+    cook = ["--cookies", str(cookie_file)] if cookie_file else []
+    return run_cmd(["gallery-dl", *cook, "-D", str(dest), "--", url], dry=dry)
+
+
+def dl_spotify(url: str, dest: Path, dry: bool) -> int:
+    if not shutil.which("spotdl") and not dry:
+        err("spotdl не установлен. Установка: curl -L https://raw.githubusercontent.com/spotDL/spotify-downloader/master/scripts/termux.sh | sh")
+        return 1
+    if "/collection/" in url:
+        err("«Любимые треки» по ссылке не скачать: Spotify требует вход через API (только Premium).")
+        warn("Выгрузите их в CSV на tunemymusic.com и поделитесь файлом в Termux (playlist-dump).")
+        return 1
+    if "/episode/" in url or "/show/" in url:
+        err("Подкасты Spotify spotDL не поддерживает.")
+        return 1
+    tmpl = "{artists} - {title}.{output-ext}"
+    if "/album/" in url:
+        tmpl = "{album}/{artists} - {title}.{output-ext}"
+    elif "/playlist/" in url:
+        tmpl = "{list-name}/{artists} - {title}.{output-ext}"
+    elif "/artist/" in url:
+        tmpl = "{album-artist}/{album}/{artists} - {title}.{output-ext}"
+    js = ensure_js(dry=dry)
+    extra = ["--yt-dlp-args", " ".join(js)] if js else []
+    return run_cmd(["spotdl", "download", "--output", f"{dest}/{tmpl}", "--threads", "2", "--max-retries", "5", *extra, "--", url], dry=dry)
+
+
+def dl_direct(url: str, dest: Path, dry: bool) -> int:
+    if not ensure_pkg("curl", "curl", dry=dry):
+        return 1
+    base_url = url.split("?", 1)[0].split("#", 1)[0]
+    common = ["curl", "-L", "--proto", "=http,https", "--proto-redir", "=http,https", "--fail", "--retry", "3", "-A", "Mozilla/5.0", "--no-clobber"]
+    if base_url.endswith("/"):
+        return run_cmd([*common, "-o", f"{dest}/download_{time.strftime('%Y%m%d-%H%M%S')}", "--", url], dry=dry)
+    return run_cmd([*common, "--output-dir", str(dest), "-OJ", "--", url], dry=dry)
+
+
+def dl_git(url: str, dest: Path, dry: bool) -> int:
+    if any(m in url for m in ("raw.githubusercontent.com/", "/releases/download/", "/archive/", "objects.githubusercontent.com/")):
+        return dl_direct(url, dest, dry)
+    if "/blob/" in url:
+        raw = re.sub(r"https?://(www\.)?github\.com/([^/]+)/([^/]+)/blob/", r"https://raw.githubusercontent.com/\2/\3/", url)
+        return dl_direct(raw, dest, dry)
+    m = re.match(r"^https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", url)
+    repo = f"{m.group(1)}/{m.group(2)}" if m else ""
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not repo:
+        err("Это не ссылка на репозиторий GitHub (нужно github.com/владелец/репозиторий).")
+        return 1
+    if not ensure_pkg("git", "git", dry=dry):
+        return 1
+    target = dest / repo.replace("/", "_")
+    if (target / ".git").is_dir():
+        say("Репозиторий уже скачан — обновляю")
+        return run_cmd(["git", "-C", str(target), "pull", "--ff-only"], dry=dry)
+    return run_cmd(["git", "clone", "--depth", "1", f"https://github.com/{repo}.git", str(target)], dry=dry)
+
+
+def dl_gdrive(url: str, dest: Path, dry: bool) -> int:
+    if not ensure_pip("gdown", "gdown", dry=dry):
+        return 1
+    if "/folders/" in url:
+        return run_cmd(["gdown", "--folder", "-O", str(dest), "--", url], dry=dry)
+    return run_cmd(["gdown", "-O", f"{dest}/", "--", url], dry=dry)
+
+
+def dl_torrent(target: str, dest: Path, dry: bool) -> int:
+    if not ensure_pkg("aria2c", "aria2", dry=dry):
+        return 1
+    return run_cmd(["aria2c", f"--dir={dest}", "--seed-time=0", "--summary-interval=0", "--follow-torrent=true", "--", target], dry=dry)
+
+
+def _find_sibling(name: str) -> str:
+    home_bin = Path.home() / "bin" / name
+    if os.access(home_bin, os.X_OK):
+        return str(home_bin)
+    here = Path(__file__).resolve().parent / name
+    if here.is_file():
+        return str(here)
+    return shutil.which(name) or str(home_bin)
+
+
+def dl_convert(url: str, service: str, cfg: dict, dry: bool) -> int:
+    pld = _find_sibling("playlist-dump")
+    if not Path(pld).is_file() and not dry:
+        err("playlist-dump не установлен. Обновите: cd ~/termux-downloader && git pull && bash install.sh")
+        return 1
+    cmd = [pld, "link", "--service", service, "--format", cfg["audio_format"], "--threads", str(cfg["threads"]), "-y", "--", url]
+    return run_cmd(cmd, dry=dry)
+
+
+def _hint_on_fail(service: str, slug: str):
+    if service in ("Twitter", "Instagram", "Threads", "Facebook", "Pinterest", "TikTok", "Reddit", "Bluesky", "Pixiv", "DeviantArt"):
+        warn(f"Сервис может требовать вход. Положите cookies в: {cookies_dir() / f'{slug}.txt'}")
+    elif service in ("YouTube", "YouTube Music"):
+        warn("Попробуйте обновить загрузчики: termux-url-opener --update")
+    elif service == "Spotify":
+        warn("Запустите ту же ссылку ещё раз — скачанные треки будут пропущены.")
+
+
+# --------------------------------------------------------------------------
+# Оркестрация загрузок (process_url / run_urls / run_torrent_file)
+# --------------------------------------------------------------------------
+def _confirm_action(question: str, timeout: int, auto_yes: bool, ui_mode: str, service: str, dry: bool) -> bool:
+    if dry or auto_yes:
+        return True
+    if _gui_enabled(ui_mode):
+        res = gui_confirm(service, question)
+        if res is not None:
+            return res
+    ans = _read_line_timeout(f"{question} [Enter — да / n — нет; через {timeout} с — отмена]: ", timeout)
+    if ans is None:
+        return False
+    return not ans.strip().lower().startswith(("n", "н"))
+
+
+def _choose_video(url: str, dest: Path, cookie_file: Path | None, service: str, cfg: dict, dry: bool) -> int:
+    q_map = {"ask": "", "best": "1", "1080": "2", "720": "3", "mp3": "4"}
+    choice = os.environ.get("TUO_CHOICE") or q_map.get(cfg["video_quality"], "")
+    if not choice and not dry and _gui_enabled(cfg["ui"]):
+        choice = gui_video_menu(service, cfg["audio_format"]) or ""
+    if not choice:
+        if dry:
+            choice = "1"
+        else:
+            print()
+            print("  1) Видео — лучшее качество  (по умолчанию)")
+            print("  2) Видео — до 1080p")
+            print("  3) Видео — до 720p (экономит место)")
+            print(f"  4) Только звук — {cfg['audio_format'].upper()}")
+            print("  5) Отмена")
+            timeout = int(os.environ.get("TUO_MENU_TIMEOUT") or cfg["menu_timeout"])
+            ans = _read_line_timeout(f"Выбор [1-5] (через {timeout} с — 1): ", timeout)
+            choice = (ans or "1").strip()[:1]
+    if choice == "2":
+        return ytdlp_video(url, dest, cookie_file, "res:1080,ext:mp4:m4a", service, dry)
+    if choice == "3":
+        return ytdlp_video(url, dest, cookie_file, "res:720,ext:mp4:m4a", service, dry)
+    if choice == "4":
+        return ytdlp_audio(url, dest, cookie_file, cfg["audio_format"], service, dry)
+    if choice == "5":
+        warn("Отменено")
+        return 2
+    return ytdlp_video(url, dest, cookie_file, "res,ext:mp4:m4a", service, dry)
+
+
+def process_url(raw_url: str, root: Path, cfg: dict, dry: bool) -> int:
+    url = normalize_url(raw_url)
+    if not url:
+        err(f"Это не ссылка: {raw_url}")
+        return 1
+    url = resolve_short(url, dry=dry)
+    url = normalize_url(url)
+    if not url:
+        err(f"Короткая ссылка привела не на http(s): {raw_url}")
+        return 1
+
+    service, kind = detect_service(url)
+    if kind not in ("spotify", "torrent", "drm"):
+        clean_path = url.split("?", 1)[0].split("#", 1)[0].lower()
+        if clean_path.endswith(".torrent"):
+            kind = "torrent"
+        elif is_direct_file(url):
+            kind = "direct"
+            if service == "Other":
+                service = "Files"
+    if kind == "torrent":
+        service = "Torrents"
+
+    dest = root / service
+    slug = re.sub(r"[^a-z0-9]+", "_", service.lower()).strip("_")
+    cdir = cookies_dir()
+    cookie_file = next((cdir / n for n in (f"{slug}.txt", "cookies.txt") if (cdir / n).is_file()), None)
+    if kind != "drm" and not dry:
+        dest.mkdir(parents=True, exist_ok=True)
+
+    print()
+    print(f"{C_B}━━━ {service} ━━━{C_0}", flush=True)
+    print(f"Ссылка: {url}")
+    print(f"Папка:  Download/Termux Downloads/{service}")
+    if cookie_file:
+        print(f"Cookies: {cookie_file}")
+
+    auto_yes = os.environ.get("TUO_YES") == "1" or cfg["auto_confirm"]
+    if kind in ("torrent", "direct", "git", "generic"):
+        if not _confirm_action("Скачать?", 30, auto_yes, cfg["ui"], service, dry):
+            warn("Отменено")
+            log_line(service, "SKIP", url, dry)
+            return 2
+    if is_mass(url):
+        warn("Это канал / плейлист / дискография — будет скачано ВСЁ (может быть очень много).")
+        if not _confirm_action("Продолжить?", 30, auto_yes, cfg["ui"], service, dry):
+            warn("Отменено")
+            log_line(service, "SKIP", url, dry)
+            return 2
+
+    rc = 1
+    if kind == "spotify":
+        rc = dl_spotify(url, dest, dry)
+    elif kind == "convert":
+        rc = dl_convert(url, service, cfg, dry)
+    elif kind == "audio_convert":
+        rc = ytdlp_audio(url, dest, cookie_file, cfg["audio_format"], service, dry)
+        if rc != 0:
+            warn("Пробую найти этот трек на других площадках…")
+            rc = dl_convert(url, service, cfg, dry)
+    elif kind == "drm":
+        err("Этот сервис защищён DRM (Widevine/FairPlay).")
+        warn("Обход DRM незаконен (ЕС/Франция, РФ, США), скрипт этого не делает.")
+        warn("Используйте офлайн-загрузку в официальном приложении сервиса.")
+        rc = 1
+    elif kind == "video":
+        rc = _choose_video(url, dest, cookie_file, service, cfg, dry)
+        if rc == 1 and any(d in url for d in ("vk.com/", "vk.ru/", "vkvideo.ru/")):
+            warn("yt-dlp не справился — пробую gallery-dl (посты с фото и т.п.)…")
+            rc = gdl(url, dest, cookie_file, dry)
+    elif kind == "audio":
+        rc = ytdlp_audio(url, dest, cookie_file, cfg["audio_format"], service, dry)
+    elif kind == "social":
+        rc = ytdlp_video(url, dest, cookie_file, "res,ext:mp4:m4a", service, dry)
+        if rc != 0:
+            warn("Пробую gallery-dl…")
+            rc = gdl(url, dest, cookie_file, dry)
+    elif kind == "gallery":
+        rc = gdl(url, dest, cookie_file, dry)
+        if rc != 0:
+            warn("Пробую yt-dlp…")
+            rc = ytdlp_video(url, dest, cookie_file, "res,ext:mp4:m4a", service, dry)
+    elif kind == "gdrive":
+        rc = dl_gdrive(url, dest, dry)
+    elif kind == "git":
+        rc = dl_git(url, dest, dry)
+    elif kind == "torrent":
+        rc = dl_torrent(url, dest, dry)
+    elif kind == "direct":
+        rc = dl_direct(url, dest, dry)
+    else:
+        rc = ytdlp_video(url, dest, cookie_file, "res,ext:mp4:m4a", service, dry)
+        if rc != 0:
+            warn("yt-dlp не справился — пробую gallery-dl…")
+            rc = gdl(url, dest, cookie_file, dry)
+        if rc != 0:
+            warn("Пробую скачать как обычный файл…")
+            ct = probe_content_type(url, dry=dry)
+            if not ct or ct.startswith("text/html"):
+                err("По ссылке веб-страница, скачивать нечего.")
+                rc = 1
+            else:
+                rc = dl_direct(url, dest, dry)
+
+    if rc == 0:
+        ok(f"Готово: {service}")
+        log_line(service, "OK", url, dry)
+        if not dry:
+            media_scan(dest)
+    elif rc == 2:
+        log_line(service, "SKIP", url, dry)
+    else:
+        err(f"Не удалось скачать: {url}")
+        log_line(service, "FAIL", url, dry)
+        _hint_on_fail(service, slug)
+    return rc
+
+
+def _resolve_root(cfg: dict) -> Path:
+    raw = os.environ.get("TUO_ROOT") or cfg["download_dir"]
+    return Path(raw).expanduser()
+
+
+def run_urls(args_list: list[str]) -> int:
+    cfg = load_config()
+    dry = os.environ.get("TUO_DRY_RUN") == "1"
+    root = _resolve_root(cfg)
+    if not dry:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            err(f"Нет доступа к памяти телефона: {root}")
+            warn("Выполните termux-setup-storage и разрешите Termux доступ к файлам.")
+            return 1
+
+    raw_input = " ".join(args_list)
+    urls = extract_urls(raw_input)
+    if not urls:
+        urls = [raw_input]
+
+    if not dry:
+        wake_lock(True)
+    okc = failc = skipc = 0
+    try:
+        for u in urls:
+            rc = process_url(u, root, cfg, dry)
+            if rc == 0:
+                okc += 1
+            elif rc == 2:
+                skipc += 1
+            else:
+                failc += 1
+    finally:
+        if not dry:
+            wake_lock(False)
+            dismiss_notification("termux-dl-progress")
+
+    total = len(urls)
+    print()
+    if failc == 0 and okc == 0 and skipc > 0:
+        warn(f"Отменено: {skipc} из {total}")
+    elif failc == 0:
+        ok(f"Скачано: {okc} из {total} → Download/Termux Downloads")
+        if not dry:
+            notify("Загрузка завершена", f"{okc} из {total} → Download/Termux Downloads")
+    else:
+        err(f"Ошибок: {failc} из {total}. Журнал: termux-url-opener --history")
+        if not dry:
+            notify("Загрузка с ошибками", f"Ошибок: {failc} из {total}")
+    return 0 if failc == 0 else 1
+
+
+def run_torrent_file(path_str: str) -> int:
+    cfg = load_config()
+    dry = os.environ.get("TUO_DRY_RUN") == "1"
+    root = _resolve_root(cfg)
+    dest = root / "Torrents"
+    if not dry:
+        dest.mkdir(parents=True, exist_ok=True)
+    print(f"Торрент-файл: {Path(path_str).name}")
+    auto_yes = os.environ.get("TUO_YES") == "1" or cfg["auto_confirm"]
+    if _confirm_action("Скачать?", 30, auto_yes, cfg["ui"], "Torrents", dry):
+        rc = dl_torrent(path_str, dest, dry)
+    else:
+        warn("Отменено")
+        rc = 2
+    status = "OK" if rc == 0 else ("SKIP" if rc == 2 else "FAIL")
+    log_line("Torrents", status, path_str, dry)
+    return rc
+
+
+# --------------------------------------------------------------------------
+# Диагностика и CLI
+# --------------------------------------------------------------------------
+def run_doctor() -> int:
+    cfg = load_config()
+    root = _resolve_root(cfg)
+    cdir = cookies_dir()
+
+    print(f"{C_B}━━━ Диагностика termux-downloader ━━━{C_0}")
     print(f"Python:  {sys.version.split()[0]} ({sys.executable})")
     print(f"Конфиг:  {config_path()}")
 
     critical_ok = True
-    # 1. Память телефона
     storage_link = Path.home() / "storage" / "shared"
     if storage_link.exists() or os.environ.get("TUO_ROOT"):
         try:
@@ -321,23 +1095,21 @@ def run_doctor() -> int:
             probe = root / f".doctor_{os.getpid()}.tmp"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
-            print(f"{c_ok}✔ Папка загрузок доступна для записи:{c_0} {root}")
+            print(f"{C_OK}✔ Папка загрузок доступна для записи:{C_0} {root}")
         except OSError as e:
-            print(f"{c_err}✘ Нет записи в {root}:{c_0} {e}")
+            print(f"{C_ERR}✘ Нет записи в {root}:{C_0} {e}")
             critical_ok = False
     else:
-        print(f"{c_err}✘ Нет доступа к памяти (~/storage/shared не найден) — выполните termux-setup-storage{c_0}")
+        print(f"{C_ERR}✘ Нет доступа к памяти (~/storage/shared не найден) — выполните termux-setup-storage{C_0}")
         critical_ok = False
 
-    # 2. Права на cookies/config
-    if os.name == "posix" and cookies_dir.exists():
-        mode = stat.S_IMODE(cookies_dir.stat().st_mode)
+    if os.name == "posix" and cdir.exists():
+        mode = stat.S_IMODE(cdir.stat().st_mode)
         if mode & 0o077:
-            print(f"{c_warn}! Слишком открытые права на {cookies_dir} ({oct(mode)}), рекомендуется 0700{c_0}")
+            print(f"{C_WARN}! Слишком открытые права на {cdir} ({oct(mode)}), рекомендуется 0700{C_0}")
         else:
-            print(f"{c_ok}✔ Права на папку cookies безопасны ({oct(mode)}){c_0}")
+            print(f"{C_OK}✔ Права на папку cookies безопасны ({oct(mode)}){C_0}")
 
-    # 3. Утилиты
     required = [
         ("yt-dlp", "видео/аудио (pip install -U 'yt-dlp[default]')"),
         ("ffmpeg", "конвертация и склейка (pkg install ffmpeg)"),
@@ -357,24 +1129,24 @@ def run_doctor() -> int:
     for cmd, desc in required:
         path = shutil.which(cmd)
         if path:
-            print(f"  {c_ok}✔{c_0} {cmd:<14} {path}")
+            print(f"  {C_OK}✔{C_0} {cmd:<14} {path}")
         else:
-            print(f"  {c_err}✘{c_0} {cmd:<14} не найден — {desc}")
+            print(f"  {C_ERR}✘{C_0} {cmd:<14} не найден — {desc}")
             critical_ok = False
 
     print("\nДополнительные компоненты:")
     for cmd, desc in optional:
         path = shutil.which(cmd)
         if path:
-            print(f"  {c_ok}✔{c_0} {cmd:<20} {path}")
+            print(f"  {C_OK}✔{C_0} {cmd:<20} {path}")
         else:
-            print(f"  {c_warn}•{c_0} {cmd:<20} не установлен — {desc}")
+            print(f"  {C_WARN}•{C_0} {cmd:<20} не установлен — {desc}")
 
     print()
     if critical_ok:
-        print(f"{c_ok}✔ Готово к работе.{c_0}")
+        print(f"{C_OK}✔ Готово к работе.{C_0}")
         return 0
-    print(f"{c_err}✘ Обнаружены критические проблемы.{c_0}")
+    print(f"{C_ERR}✘ Обнаружены критические проблемы.{C_0}")
     return 1
 
 
@@ -394,6 +1166,7 @@ def _cmd_config(args) -> int:
         print(f"CFG_THREADS={int(cfg['threads'])}")
         print(f"CFG_YES={'1' if cfg['auto_confirm'] else '0'}")
         print(f"CFG_MENU_TIMEOUT={int(cfg['menu_timeout'])}")
+        print(f"CFG_UI={cfg['ui']}")
         return 0
     if action == "reset":
         p = save_config(dict(DEFAULT_CONFIG))
@@ -425,6 +1198,7 @@ def _cmd_config(args) -> int:
 
 
 def main(argv=None) -> int:
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
     p = argparse.ArgumentParser(prog="termux-dl")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -437,6 +1211,12 @@ def main(argv=None) -> int:
 
     pc = sub.add_parser("classify")
     pc.add_argument("url")
+
+    pr = sub.add_parser("run")
+    pr.add_argument("urls", nargs="+")
+
+    pt = sub.add_parser("torrent")
+    pt.add_argument("file")
 
     pg = sub.add_parser("config")
     pg.add_argument("action", nargs="?", choices=["show", "get", "set", "reset", "env"])
@@ -462,6 +1242,10 @@ def main(argv=None) -> int:
         mass = "1" if is_mass(args.url) else "0"
         print(f"{svc}\t{kind}\t{mass}")
         return 0
+    if args.cmd == "run":
+        return run_urls(args.urls)
+    if args.cmd == "torrent":
+        return run_torrent_file(args.file)
     if args.cmd == "config":
         return _cmd_config(args)
     if args.cmd == "doctor":
