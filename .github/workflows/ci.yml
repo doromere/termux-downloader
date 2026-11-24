@@ -32,4 +32,8 @@ jobs:
         run: pytest -v
 
       - name: CLI dry-run and routing tests
-        run: bash tests/test_cli_dry_run.sh
+        run: |
+          sudo mkdir -p /data/data/com.termux/files/usr/bin
+          sudo ln -sf /bin/bash /data/data/com.termux/files/usr/bin/bash
+          sudo ln -sf /bin/sh /data/data/com.termux/files/usr/bin/sh
+          bash tests/test_cli_dry_run.sh
