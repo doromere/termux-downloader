@@ -28,6 +28,7 @@ import androidx.lifecycle.lifecycleScope
 import com.yausername.youtubedl_android.YoutubeDL
 import io.github.doromere.downloader.data.DownloadRepository
 import io.github.doromere.downloader.data.DownloadTask
+import io.github.doromere.downloader.data.TrackProgress
 import io.github.doromere.downloader.domain.DownloadKind
 import io.github.doromere.downloader.domain.ParsedPlaylist
 import io.github.doromere.downloader.domain.PlaylistDumpParser
@@ -274,7 +275,11 @@ class MainActivity : ComponentActivity() {
             kind = DownloadKind.PLAYLIST_DUMP,
             quality = VideoQuality.AUDIO_ONLY,
             audioFormat = audioFmt,
-            detail = "Треков: ${parsed.tracks.size}"
+            title = parsed.name,
+            detail = "Треков: ${parsed.tracks.size}",
+            tracks = parsed.tracks.mapIndexed { idx, t ->
+                TrackProgress(index = idx, title = t.title, artist = t.artist)
+            }
         )
         DownloadRepository.savePlaylistTracks(task.id, parsed.name, parsed.tracks)
         DownloadRepository.enqueue(task)

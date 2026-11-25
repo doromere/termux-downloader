@@ -13,6 +13,25 @@ enum class DownloadStatus {
     CANCELLED
 }
 
+enum class TrackStatus {
+    QUEUED,
+    RUNNING,
+    COMPLETED,
+    FAILED,
+    CANCELLED
+}
+
+data class TrackProgress(
+    val index: Int,
+    val title: String,
+    val artist: String = "",
+    val status: TrackStatus = TrackStatus.QUEUED,
+    val progress: Float = 0f
+) {
+    val displayTitle: String
+        get() = if (artist.isNotBlank()) "$artist — $title" else title
+}
+
 data class DownloadTask(
     val id: String = UUID.randomUUID().toString(),
     val url: String,
@@ -20,11 +39,13 @@ data class DownloadTask(
     val kind: DownloadKind,
     val quality: VideoQuality,
     val audioFormat: AudioFormat,
+    val title: String? = null,
     val status: DownloadStatus = DownloadStatus.QUEUED,
     val progress: Float = 0f,
     val detail: String = "В очереди",
     val savedPath: String? = null,
     val savedUri: String? = null,
+    val tracks: List<TrackProgress> = emptyList(),
     val createdAt: Long = System.currentTimeMillis()
 )
 

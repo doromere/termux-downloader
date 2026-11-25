@@ -652,6 +652,7 @@ def _run_ytdlp_api(url: str, dest: Path, cookie_file: Path | None, fmt_sort: str
     except ImportError:
         return -1
 
+    out_name = "%(title).150B.%(ext)s" if audio_fmt else "%(title).150B [%(id)s].%(ext)s"
     ydl_opts = {
         "noplaylist": True,
         "windowsfilenames": True,
@@ -659,7 +660,7 @@ def _run_ytdlp_api(url: str, dest: Path, cookie_file: Path | None, fmt_sort: str
         "retries": 10,
         "fragment_retries": 10,
         "concurrent_fragment_downloads": 4,
-        "outtmpl": str(dest / "%(playlist_title|)s" / "%(title).150B [%(id)s].%(ext)s"),
+        "outtmpl": str(dest / "%(playlist_title|)s" / out_name),
         "quiet": True,
         "no_warnings": False,
         "noprogress": True,
@@ -709,7 +710,7 @@ def ytdlp_video(url: str, dest: Path, cookie_file: Path | None, fmt_sort: str, s
         if rc != -1:
             return rc
     cook = ["--cookies", str(cookie_file)] if cookie_file else []
-    tmpl = f"{dest}/%(playlist_title|)s/%(title).150B [%(id)s].%(ext)s"
+    tmpl = f"{dest}/%(playlist_title|)s/%(title).150B.%(ext)s"
     cmd = ["yt-dlp", *YTDLP_CLI_BASE, *js, *cook, "-S", fmt_sort, "--merge-output-format", "mp4", "-o", tmpl, "--", url]
     return run_cmd(cmd, dry=dry)
 
@@ -729,7 +730,7 @@ def ytdlp_audio(url: str, dest: Path, cookie_file: Path | None, audio_fmt: str, 
         afmt = ["-f", "bestaudio[acodec=opus]/bestaudio/best", "-x", "--audio-format", "opus"]
     else:
         afmt = ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-    tmpl = f"{dest}/%(playlist_title|)s/%(title).150B [%(id)s].%(ext)s"
+    tmpl = f"{dest}/%(playlist_title|)s/%(title).150B.%(ext)s"
     cmd = ["yt-dlp", *YTDLP_CLI_BASE, *js, *cook, *afmt, "--embed-thumbnail", "--convert-thumbnails", "jpg", "-o", tmpl, "--", url]
     return run_cmd(cmd, dry=dry)
 

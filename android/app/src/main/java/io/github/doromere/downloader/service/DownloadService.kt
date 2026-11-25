@@ -20,6 +20,8 @@ import io.github.doromere.downloader.data.DownloadStatus
 import io.github.doromere.downloader.data.DownloadTask
 import io.github.doromere.downloader.data.MusicCatalogResolver
 import io.github.doromere.downloader.data.StorageSaver
+import io.github.doromere.downloader.data.TrackProgress
+import io.github.doromere.downloader.data.TrackStatus
 import io.github.doromere.downloader.domain.AudioFormat
 import io.github.doromere.downloader.domain.DownloadKind
 import io.github.doromere.downloader.domain.VideoQuality
@@ -112,9 +114,17 @@ class DownloadService : Service() {
                     downloadPlaylistDump(task, staging)
                     return
                 }
-                DownloadKind.AUDIO -> downloadWithYtDlp(task, task.url, staging, audioOnly = true)
+                DownloadKind.AUDIO -> {
+                    if (isYtPlaylistUrl(task.url) && tryDownloadYtPlaylist(task, staging, audioOnly = true)) {
+                        return
+                    }
+                    downloadWithYtDlp(task, task.url, staging, audioOnly = true)
+                }
                 DownloadKind.VIDEO, DownloadKind.GENERIC -> {
                     val audioOnly = task.quality == VideoQuality.AUDIO_ONLY
+                    if (isYtPlaylistUrl(task.url) && tryDownloadYtPlaylist(task, staging, audioOnly = audioOnly)) {
+                        return
+                    }
                     downloadWithYtDlp(task, task.url, staging, audioOnly = audioOnly)
                 }
             }
@@ -130,11 +140,13 @@ class DownloadService : Service() {
                 failTask(task, "Файл не был создан загрузчиком")
             } else {
                 val first = saved.first()
+                val fileTitle = first.displayPath.substringAfterLast('/').substringBeforeLast('.')
                 DownloadRepository.updateTask(task.id) {
                     it.copy(
+                        title = it.title ?: fileTitle,
                         status = DownloadStatus.COMPLETED,
                         progress = 100f,
-                        detail = "Сохранено (${saved.size} файл.)",
+                        detail = if (saved.size > 1) "Сохранено (${saved.size} файл.)" else "Сохранено",
                         savedPath = first.displayPath,
                         savedUri = first.contentUri
                     )
@@ -158,6 +170,44 @@ class DownloadService : Service() {
         }
     }
 
+    private fun isYtPlaylistUrl(url: String): Boolean {
+        val low = url.lowercase()
+        return low.contains("youtube.com/playlist") || low.contains("youtube.com/browse/")
+    }
+
+    private fun tryDownloadYtPlaylist(task: DownloadTask, staging: File, audioOnly: Boolean): Boolean {
+        DownloadRepository.updateTask(task.id) { it.copy(detail = "Запрос списка треков…") }
+        val dumpReq = YoutubeDLRequest(task.url).apply {
+            addOption("--flat-playlist")
+            addOption("--dump-single-json")
+        }
+        val jsonText = runCatching {
+            YoutubeDL.getInstance().execute(dumpReq, task.id) { _, _, _ -> }.out
+        }.getOrNull() ?: return false
+
+        val obj = runCatching { org.json.JSONObject(jsonText) }.getOrNull() ?: return false
+        val entries = obj.optJSONArray("entries") ?: return false
+        if (entries.length() == 0) return false
+
+        val playlistTitle = obj.optString("title").ifBlank { task.service }
+        val items = mutableListOf<Pair<String, TrackProgress>>()
+        for (i in 0 until entries.length()) {
+            val e = entries.optJSONObject(i) ?: continue
+            val entryUrl = e.optString("url").ifBlank {
+                val id = e.optString("id")
+                if (id.isNotBlank()) "https://www.youtube.com/watch?v=$id" else ""
+            }
+            if (entryUrl.isBlank()) continue
+            val title = e.optString("title").ifBlank { "Трек ${i + 1}" }
+            val artist = e.optString("uploader").ifBlank { e.optString("channel") }
+            items.add(entryUrl to TrackProgress(index = items.size, title = title, artist = artist))
+        }
+        if (items.isEmpty()) return false
+
+        executeTrackQueue(task, staging, playlistTitle, items, audioOnly = audioOnly, isSearch = false)
+        return true
+    }
+
     private fun downloadMusicCatalog(task: DownloadTask, staging: File) {
         DownloadRepository.updateTask(task.id) { it.copy(detail = "Запрос треклиста…") }
         val catalog = MusicCatalogResolver.resolve(task.url)
@@ -176,8 +226,30 @@ class DownloadService : Service() {
         folderName: String?,
         tracks: List<CatalogTrack>
     ) {
-        val total = tracks.size
-        if (total == 0) throw IllegalStateException("Список треков пуст")
+        if (tracks.isEmpty()) throw IllegalStateException("Список треков пуст")
+        val items = tracks.mapIndexed { idx, t ->
+            val query = listOf(t.artist, t.title).filter { it.isNotBlank() }.joinToString(" ")
+            "ytsearch3:$query" to TrackProgress(index = idx, title = t.title, artist = t.artist)
+        }
+        executeTrackQueue(task, staging, folderName, items, audioOnly = true, isSearch = true)
+    }
+
+    private fun executeTrackQueue(
+        task: DownloadTask,
+        staging: File,
+        folderName: String?,
+        items: List<Pair<String, TrackProgress>>,
+        audioOnly: Boolean,
+        isSearch: Boolean
+    ) {
+        val total = items.size
+        val trackList = items.map { it.second }
+        val cleanTitle = folderName?.takeIf { it.isNotBlank() }
+            ?: if (total == 1) trackList.first().displayTitle else "${task.service} ($total треков)"
+
+        DownloadRepository.updateTask(task.id) {
+            it.copy(title = cleanTitle, tracks = trackList)
+        }
 
         val targetDir = if (!folderName.isNullOrBlank()) {
             File(staging, folderName.replace(Regex("""[\\/:*?"<>|]+"""), "_")).apply { mkdirs() }
@@ -185,41 +257,126 @@ class DownloadService : Service() {
             staging
         }
 
-        for ((idx, track) in tracks.withIndex()) {
+        var lastNotifMs = 0L
+        var completedCount = 0
+
+        for ((idx, pair) in items.withIndex()) {
             if (cancelledIds.contains(task.id) ||
                 DownloadRepository.getTask(task.id)?.status == DownloadStatus.CANCELLED
             ) {
+                markRemainingTracksCancelled(task.id)
                 return
             }
-            val query = listOf(track.artist, track.title).filter { it.isNotBlank() }.joinToString(" ")
-            val overallPct = ((idx.toFloat() / total) * 100f).coerceIn(0f, 99f)
-            val label = "${idx + 1}/$total: $query"
-            DownloadRepository.updateTask(task.id) {
-                it.copy(progress = overallPct, detail = label)
-            }
-            updateNotification(task.service, label, task.id, overallPct.toInt(), indeterminate = false)
+            val (targetUrl, trackInfo) = pair
+            val trackLabel = trackInfo.displayTitle
+            val basePct = (idx.toFloat() / total) * 100f
 
-            val request = buildAudioRequest("ytsearch3:$query", targetDir, task.audioFormat).apply {
-                addOption("--match-filter", "duration<=?900 & !is_live")
-                addOption("--max-downloads", "1")
+            DownloadRepository.updateTask(task.id) { current ->
+                current.copy(
+                    progress = basePct,
+                    detail = "${idx + 1}/$total: $trackLabel",
+                    tracks = current.tracks.map {
+                        if (it.index == idx) it.copy(status = TrackStatus.RUNNING, progress = 0f) else it
+                    }
+                )
             }
+            updateNotification(task.service, "${idx + 1}/$total: $trackLabel", task.id, basePct.toInt(), false)
+
+            val beforeFiles = targetDir.listFiles()?.map { it.name }?.toSet().orEmpty()
+            val request = if (audioOnly) {
+                buildAudioRequest(targetUrl, targetDir, task.audioFormat)
+            } else {
+                buildVideoRequest(targetUrl, targetDir, task.quality)
+            }
+            if (isSearch) {
+                request.addOption("--match-filter", "duration<=?900 & !is_live")
+                request.addOption("--max-downloads", "1")
+            }
+
             runCatching {
-                YoutubeDL.getInstance().execute(request, task.id) { _, _, _ -> }
+                YoutubeDL.getInstance().execute(request, task.id) { progress, _, _ ->
+                    if (cancelledIds.contains(task.id)) return@execute
+                    val tPct = if (progress >= 0f) progress.coerceIn(0f, 100f) else 0f
+                    val overall = (((idx + tPct / 100f) / total) * 100f).coerceIn(0f, 99f)
+                    DownloadRepository.updateTaskInMemory(task.id) { current ->
+                        current.copy(
+                            progress = overall,
+                            tracks = current.tracks.map {
+                                if (it.index == idx) it.copy(progress = tPct) else it
+                            }
+                        )
+                    }
+                    val now = System.currentTimeMillis()
+                    if (now - lastNotifMs >= 800L) {
+                        lastNotifMs = now
+                        updateNotification(
+                            task.service,
+                            "${idx + 1}/$total (${tPct.toInt()}%): $trackLabel",
+                            task.id,
+                            overall.toInt(),
+                            false
+                        )
+                    }
+                }
+            }
+
+            if (cancelledIds.contains(task.id) ||
+                DownloadRepository.getTask(task.id)?.status == DownloadStatus.CANCELLED
+            ) {
+                markRemainingTracksCancelled(task.id)
+                return
+            }
+
+            val afterFiles = targetDir.listFiles()
+                ?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
+                ?.map { it.name }
+                ?.toSet()
+                .orEmpty()
+            val trackDone = (afterFiles - beforeFiles).isNotEmpty()
+            if (trackDone) completedCount++
+
+            DownloadRepository.updateTask(task.id) { current ->
+                current.copy(
+                    tracks = current.tracks.map {
+                        if (it.index == idx) {
+                            it.copy(
+                                status = if (trackDone) TrackStatus.COMPLETED else TrackStatus.FAILED,
+                                progress = if (trackDone) 100f else 0f
+                            )
+                        } else {
+                            it
+                        }
+                    }
+                )
             }
         }
         val saved = StorageSaver.saveFilesToDownloads(this, targetDir, task.service, folderName)
-        if (saved.isEmpty()) throw IllegalStateException("Не удалось скачать треки с YouTube")
+        if (saved.isEmpty()) throw IllegalStateException("Не удалось скачать треки")
         val first = saved.first()
         DownloadRepository.updateTask(task.id) {
             it.copy(
                 status = DownloadStatus.COMPLETED,
                 progress = 100f,
-                detail = "Сохранено (${saved.size} из $total)",
+                detail = "Сохранено ($completedCount из $total)",
                 savedPath = first.displayPath,
                 savedUri = first.contentUri
             )
         }
-        postResultNotification(task.service, "Скачано ${saved.size} треков → ${task.service}")
+        postResultNotification(task.service, "Скачано $completedCount из $total → $cleanTitle")
+    }
+
+    private fun markRemainingTracksCancelled(taskId: String) {
+        DownloadRepository.updateTask(taskId) { current ->
+            current.copy(
+                tracks = current.tracks.map {
+                    if (it.status == TrackStatus.QUEUED || it.status == TrackStatus.RUNNING) {
+                        it.copy(status = TrackStatus.CANCELLED)
+                    } else {
+                        it
+                    }
+                }
+            )
+        }
     }
 
     private fun downloadWithYtDlp(task: DownloadTask, url: String, staging: File, audioOnly: Boolean) {
@@ -234,7 +391,7 @@ class DownloadService : Service() {
             val pct = if (progress >= 0f) progress.coerceIn(0f, 100f) else 0f
             val etaTxt = if (eta > 0) " • ETA ${eta}s" else ""
             val msg = if (progress >= 0f) "${pct.toInt()}%$etaTxt" else line.take(60).ifBlank { "Загрузка…" }
-            DownloadRepository.updateTask(task.id) {
+            DownloadRepository.updateTaskInMemory(task.id) {
                 it.copy(progress = pct, detail = msg)
             }
             val now = System.currentTimeMillis()
@@ -259,7 +416,7 @@ class DownloadService : Service() {
             addOption("--fragment-retries", "10")
             addOption("-S", sort)
             addOption("--merge-output-format", "mp4")
-            addOption("-o", File(staging, "%(title).120B [%(id)s].%(ext)s").absolutePath)
+            addOption("-o", File(staging, "%(title).120B.%(ext)s").absolutePath)
         }
     }
 
@@ -287,7 +444,7 @@ class DownloadService : Service() {
                     addOption("--audio-quality", "0")
                 }
             }
-            addOption("-o", File(staging, "%(title).120B [%(id)s].%(ext)s").absolutePath)
+            addOption("-o", File(staging, "%(title).120B.%(ext)s").absolutePath)
         }
     }
 
@@ -346,7 +503,7 @@ class DownloadService : Service() {
                         if (now - lastNotif >= 500L) {
                             lastNotif = now
                             val msg = if (total > 0) "${pct.toInt()}%" else "${downloaded / 1024} KiB"
-                            DownloadRepository.updateTask(task.id) { it.copy(progress = pct, detail = msg) }
+                            DownloadRepository.updateTaskInMemory(task.id) { it.copy(progress = pct, detail = msg) }
                             updateNotification(task.service, msg, task.id, pct.toInt(), total <= 0)
                         }
                     }

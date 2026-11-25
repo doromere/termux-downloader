@@ -53,6 +53,12 @@ object DownloadRepository {
         saveHistory()
     }
 
+    fun updateTaskInMemory(id: String, transform: (DownloadTask) -> DownloadTask) {
+        _tasks.update { list ->
+            list.map { if (it.id == id) transform(it) else it }
+        }
+    }
+
     fun savePlaylistTracks(taskId: String, folderName: String, tracks: List<CatalogTrack>) {
         if (!::appContext.isInitialized) return
         val dir = File(appContext.filesDir, "playlists").apply { mkdirs() }
@@ -126,6 +132,18 @@ object DownloadRepository {
         if (!::appContext.isInitialized) return
         val arr = JSONArray()
         for (t in _tasks.value.take(100)) {
+            val tracksArr = JSONArray()
+            for (tr in t.tracks) {
+                tracksArr.put(
+                    JSONObject().apply {
+                        put("index", tr.index)
+                        put("title", tr.title)
+                        put("artist", tr.artist)
+                        put("status", tr.status.name)
+                        put("progress", tr.progress.toDouble())
+                    }
+                )
+            }
             arr.put(
                 JSONObject().apply {
                     put("id", t.id)
@@ -134,11 +152,13 @@ object DownloadRepository {
                     put("kind", t.kind.name)
                     put("quality", t.quality.name)
                     put("audioFormat", t.audioFormat.name)
+                    put("title", t.title ?: JSONObject.NULL)
                     put("status", t.status.name)
                     put("progress", t.progress.toDouble())
                     put("detail", t.detail)
                     put("savedPath", t.savedPath ?: JSONObject.NULL)
                     put("savedUri", t.savedUri ?: JSONObject.NULL)
+                    put("tracks", tracksArr)
                     put("createdAt", t.createdAt)
                 }
             )
@@ -157,13 +177,35 @@ object DownloadRepository {
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
                 val rawStatus = DownloadStatus.valueOf(o.getString("status"))
-                // Any interrupted task from a killed process is marked FAILED on restart
                 val status = if (rawStatus == DownloadStatus.RUNNING || rawStatus == DownloadStatus.QUEUED) {
                     DownloadStatus.FAILED
                 } else {
                     rawStatus
                 }
                 val detail = if (status != rawStatus) "Прервано при перезапуске" else o.optString("detail")
+                val tracks = mutableListOf<TrackProgress>()
+                val tracksArr = o.optJSONArray("tracks")
+                if (tracksArr != null) {
+                    for (j in 0 until tracksArr.length()) {
+                        val to = tracksArr.getJSONObject(j)
+                        val rawTs = runCatching { TrackStatus.valueOf(to.optString("status")) }
+                            .getOrDefault(TrackStatus.QUEUED)
+                        val ts = if (rawTs == TrackStatus.RUNNING || rawTs == TrackStatus.QUEUED) {
+                            TrackStatus.FAILED
+                        } else {
+                            rawTs
+                        }
+                        tracks.add(
+                            TrackProgress(
+                                index = to.optInt("index", j),
+                                title = to.optString("title"),
+                                artist = to.optString("artist"),
+                                status = ts,
+                                progress = to.optDouble("progress", 0.0).toFloat()
+                            )
+                        )
+                    }
+                }
                 loaded.add(
                     DownloadTask(
                         id = o.getString("id"),
@@ -172,11 +214,13 @@ object DownloadRepository {
                         kind = DownloadKind.valueOf(o.getString("kind")),
                         quality = VideoQuality.valueOf(o.getString("quality")),
                         audioFormat = AudioFormat.valueOf(o.getString("audioFormat")),
+                        title = if (o.isNull("title")) null else o.optString("title"),
                         status = status,
                         progress = o.optDouble("progress", 0.0).toFloat(),
                         detail = detail,
                         savedPath = if (o.isNull("savedPath")) null else o.optString("savedPath"),
                         savedUri = if (o.isNull("savedUri")) null else o.optString("savedUri"),
+                        tracks = tracks,
                         createdAt = o.optLong("createdAt", System.currentTimeMillis())
                     )
                 )
