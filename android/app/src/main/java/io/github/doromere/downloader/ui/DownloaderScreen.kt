@@ -11,21 +11,28 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
@@ -44,6 +51,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -57,6 +65,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -79,6 +89,10 @@ fun DownloaderScreen(
     isUpdatingYtDlp: Boolean,
     onStartDownload: (String, VideoQuality) -> Unit,
     onImportPlaylist: () -> Unit,
+    onImportCookies: () -> Unit,
+    onClearCookies: () -> Unit,
+    onPickSaveFolder: () -> Unit,
+    onResetSaveFolder: () -> Unit,
     onOpenTask: (DownloadTask) -> Unit,
     onCancelTask: (String) -> Unit,
     onRetryTask: (DownloadTask) -> Unit,
@@ -89,8 +103,10 @@ fun DownloaderScreen(
 ) {
     val tasks by DownloadRepository.tasks.collectAsState()
     val settings by DownloadRepository.settings.collectAsState()
+    val cookiesSize by DownloadRepository.cookiesSizeBytes.collectAsState()
     var selectedQuality by remember(settings.defaultQuality) { mutableStateOf(settings.defaultQuality) }
     var showSettings by remember { mutableStateOf(false) }
+    var errorDialogTask by remember { mutableStateOf<DownloadTask?>(null) }
     val collapsedGroups = remember { mutableStateMapOf<String, Boolean>() }
     val expandedAlbums = remember { mutableStateMapOf<String, Boolean>() }
     val clipboard = LocalClipboardManager.current
@@ -246,6 +262,7 @@ fun DownloaderScreen(
                                     task = task,
                                     tracksExpanded = isAlbumExpanded,
                                     onToggleTracks = { expandedAlbums[task.id] = !isAlbumExpanded },
+                                    onShowError = { errorDialogTask = task },
                                     onOpen = { onOpenTask(task) },
                                     onCancel = { onCancelTask(task.id) },
                                     onRetry = { onRetryTask(task) },
@@ -262,13 +279,57 @@ fun DownloaderScreen(
     if (showSettings) {
         SettingsDialog(
             settings = settings,
+            cookiesSizeBytes = cookiesSize,
             isUpdating = isUpdatingYtDlp,
             onDismiss = { showSettings = false },
             onSave = {
                 onUpdateSettings(it)
                 showSettings = false
             },
+            onImportCookies = onImportCookies,
+            onClearCookies = onClearCookies,
+            onPickSaveFolder = onPickSaveFolder,
+            onResetSaveFolder = onResetSaveFolder,
             onUpdateYtDlp = onUpdateYtDlp
+        )
+    }
+
+    errorDialogTask?.let { failedTask ->
+        val fullLog = failedTask.errorLog ?: failedTask.detail
+        AlertDialog(
+            onDismissRequest = { errorDialogTask = null },
+            title = { Text("${failedTask.service}: подробности ошибки") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = fullLog,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    clipboard.setText(AnnotatedString("${failedTask.url}\n\n$fullLog"))
+                    errorDialogTask = null
+                }) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Копировать")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { errorDialogTask = null }) {
+                    Text("Закрыть")
+                }
+            }
         )
     }
 }
@@ -320,13 +381,19 @@ private fun CompactTaskCard(
     task: DownloadTask,
     tracksExpanded: Boolean,
     onToggleTracks: () -> Unit,
+    onShowError: () -> Unit,
     onOpen: () -> Unit,
     onCancel: () -> Unit,
     onRetry: () -> Unit,
     onRemove: () -> Unit
 ) {
+    val cardModifier = if (task.status == DownloadStatus.FAILED) {
+        Modifier.fillMaxWidth().clickable(onClick = onShowError)
+    } else {
+        Modifier.fillMaxWidth()
+    }
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = cardModifier,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
     ) {
         Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
@@ -342,19 +409,17 @@ private fun CompactTaskCard(
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "${task.quality.label} • ${task.detail}",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (task.status == DownloadStatus.FAILED) {
-                                MaterialTheme.colorScheme.error
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            }
-                        )
-                    }
+                    Text(
+                        text = "${task.quality.label} • ${task.detail}",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (task.status == DownloadStatus.FAILED) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
                 }
 
                 if (task.tracks.isNotEmpty()) {
@@ -372,6 +437,16 @@ private fun CompactTaskCard(
                         Icon(Icons.Default.Close, contentDescription = "Отменить", modifier = Modifier.size(18.dp))
                     }
                 } else {
+                    if (task.status == DownloadStatus.FAILED) {
+                        IconButton(onClick = onShowError, modifier = Modifier.size(32.dp)) {
+                            Icon(
+                                Icons.Default.Info,
+                                contentDescription = "Лог ошибки",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
                     if (task.status == DownloadStatus.COMPLETED && task.savedUri != null) {
                         IconButton(onClick = onOpen, modifier = Modifier.size(32.dp)) {
                             Icon(
@@ -488,19 +563,28 @@ private fun TrackProgressRow(track: TrackProgress) {
 @Composable
 private fun SettingsDialog(
     settings: AppSettings,
+    cookiesSizeBytes: Long,
     isUpdating: Boolean,
     onDismiss: () -> Unit,
     onSave: (AppSettings) -> Unit,
+    onImportCookies: () -> Unit,
+    onClearCookies: () -> Unit,
+    onPickSaveFolder: () -> Unit,
+    onResetSaveFolder: () -> Unit,
     onUpdateYtDlp: () -> Unit
 ) {
     var quality by remember { mutableStateOf(settings.defaultQuality) }
     var audioFmt by remember { mutableStateOf(settings.audioFormat) }
+    var useAria2c by remember { mutableStateOf(settings.useAria2c) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Настройки") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
                 Text("Качество по умолчанию", style = MaterialTheme.typography.labelLarge)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     VideoQuality.entries.forEach { q ->
@@ -521,6 +605,71 @@ private fun SettingsDialog(
                         )
                     }
                 }
+
+                HorizontalDivider()
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Ускоритель aria2c", style = MaterialTheme.typography.labelLarge)
+                        Text(
+                            "Многопоточная загрузка через libaria2c",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = useAria2c, onCheckedChange = { useAria2c = it })
+                }
+
+                HorizontalDivider()
+
+                Text("Папка сохранения", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    text = settings.customFolderLabel ?: "Download/Termux Downloads (по умолчанию)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onPickSaveFolder, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Выбрать")
+                    }
+                    if (settings.customFolderUri != null) {
+                        TextButton(onClick = onResetSaveFolder) {
+                            Text("Сбросить")
+                        }
+                    }
+                }
+
+                HorizontalDivider()
+
+                Text("Cookies (X, Instagram, 18+)", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    text = if (cookiesSizeBytes > 0L) {
+                        "Загружен cookies.txt (${(cookiesSizeBytes / 1024.0).coerceAtLeast(0.1).let { "%.1f".format(it) }} КБ)"
+                    } else {
+                        "Файл cookies.txt не загружен"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onImportCookies, modifier = Modifier.weight(1f)) {
+                        Text("Импорт cookies.txt")
+                    }
+                    if (cookiesSizeBytes > 0L) {
+                        TextButton(onClick = onClearCookies) {
+                            Text("Удалить")
+                        }
+                    }
+                }
+
+                HorizontalDivider()
+
                 OutlinedButton(
                     onClick = onUpdateYtDlp,
                     enabled = !isUpdating,
@@ -531,7 +680,15 @@ private fun SettingsDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSave(AppSettings(quality, audioFmt)) }) {
+            TextButton(onClick = {
+                onSave(
+                    settings.copy(
+                        defaultQuality = quality,
+                        audioFormat = audioFmt,
+                        useAria2c = useAria2c
+                    )
+                )
+            }) {
                 Text("Сохранить")
             }
         },

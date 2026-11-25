@@ -163,8 +163,10 @@ YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno
 
 В каталоге [android/](android/) находится нативное Android-приложение на **Kotlin + Jetpack Compose + `youtubedl-android`** (`yt-dlp` + `ffmpeg` + `aria2c`):
 - приём ссылок и `.csv`/`.txt`-плейлистов через системное меню «Поделиться» или кнопку `CSV/TXT`;
+- компактная группировка загрузок по источникам и выпадающий список треков альбома/плейлиста с прогрессом;
 - фоновый `ForegroundService` с прогрессом и отменой из уведомления;
-- сохранение в `Download/Termux Downloads/` через `MediaStore` и кнопка открытия файла;
+- импорт `cookies.txt` (X, Instagram, YouTube 18+), просмотр подробного лога ошибок, ускоритель `aria2c`;
+- сохранение в `Download/Termux Downloads/` через `MediaStore` или в любую папку через **SAF** + кнопка открытия файла;
 - split-APK по архитектурам (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64` + `universal`).
 
 Сборка Debug APK запускается автоматически в [android.yml](.github/workflows/android.yml), а релизные APK по тегу `v*` публикуются в **GitHub Releases** ([release-android.yml](.github/workflows/release-android.yml)) — обновления удобно отслеживать через **Obtainium**.

@@ -16,7 +16,11 @@ object DownloadRepository {
     private const val PREFS_NAME = "downloader_prefs"
     private const val KEY_QUALITY = "default_quality"
     private const val KEY_AUDIO_FMT = "audio_format"
+    private const val KEY_FOLDER_URI = "custom_folder_uri"
+    private const val KEY_FOLDER_LABEL = "custom_folder_label"
+    private const val KEY_USE_ARIA2C = "use_aria2c"
     private const val HISTORY_FILE = "tasks.json"
+    private const val COOKIES_FILE = "cookies.txt"
 
     private lateinit var appContext: Context
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
@@ -25,11 +29,40 @@ object DownloadRepository {
     private val _settings = MutableStateFlow(AppSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
+    private val _cookiesSizeBytes = MutableStateFlow(0L)
+    val cookiesSizeBytes: StateFlow<Long> = _cookiesSizeBytes.asStateFlow()
+
     fun init(context: Context) {
         if (::appContext.isInitialized) return
         appContext = context.applicationContext
         loadSettings()
         loadHistory()
+        refreshCookiesInfo()
+    }
+
+    fun cookiesFile(): File? {
+        if (!::appContext.isInitialized) return null
+        val f = File(appContext.filesDir, COOKIES_FILE)
+        return if (f.isFile && f.length() > 0L) f else null
+    }
+
+    fun saveCookies(content: String) {
+        if (!::appContext.isInitialized) return
+        val f = File(appContext.filesDir, COOKIES_FILE)
+        f.writeText(content, Charsets.UTF_8)
+        refreshCookiesInfo()
+    }
+
+    fun clearCookies() {
+        if (!::appContext.isInitialized) return
+        File(appContext.filesDir, COOKIES_FILE).delete()
+        refreshCookiesInfo()
+    }
+
+    private fun refreshCookiesInfo() {
+        if (!::appContext.isInitialized) return
+        val f = File(appContext.filesDir, COOKIES_FILE)
+        _cookiesSizeBytes.value = if (f.isFile) f.length() else 0L
     }
 
     fun updateSettings(newSettings: AppSettings) {
@@ -38,6 +71,9 @@ object DownloadRepository {
         appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .putString(KEY_QUALITY, newSettings.defaultQuality.name)
             .putString(KEY_AUDIO_FMT, newSettings.audioFormat.name)
+            .putString(KEY_FOLDER_URI, newSettings.customFolderUri)
+            .putString(KEY_FOLDER_LABEL, newSettings.customFolderLabel)
+            .putBoolean(KEY_USE_ARIA2C, newSettings.useAria2c)
             .apply()
     }
 
@@ -124,7 +160,10 @@ object DownloadRepository {
         val af = runCatching {
             AudioFormat.valueOf(prefs.getString(KEY_AUDIO_FMT, AudioFormat.MP3.name)!!)
         }.getOrDefault(AudioFormat.MP3)
-        _settings.value = AppSettings(q, af)
+        val folderUri = prefs.getString(KEY_FOLDER_URI, null)
+        val folderLabel = prefs.getString(KEY_FOLDER_LABEL, null)
+        val useAria2c = prefs.getBoolean(KEY_USE_ARIA2C, false)
+        _settings.value = AppSettings(q, af, folderUri, folderLabel, useAria2c)
     }
 
     @Synchronized
@@ -156,6 +195,7 @@ object DownloadRepository {
                     put("status", t.status.name)
                     put("progress", t.progress.toDouble())
                     put("detail", t.detail)
+                    put("errorLog", t.errorLog ?: JSONObject.NULL)
                     put("savedPath", t.savedPath ?: JSONObject.NULL)
                     put("savedUri", t.savedUri ?: JSONObject.NULL)
                     put("tracks", tracksArr)
@@ -218,6 +258,7 @@ object DownloadRepository {
                         status = status,
                         progress = o.optDouble("progress", 0.0).toFloat(),
                         detail = detail,
+                        errorLog = if (o.isNull("errorLog")) null else o.optString("errorLog"),
                         savedPath = if (o.isNull("savedPath")) null else o.optString("savedPath"),
                         savedUri = if (o.isNull("savedUri")) null else o.optString("savedUri"),
                         tracks = tracks,

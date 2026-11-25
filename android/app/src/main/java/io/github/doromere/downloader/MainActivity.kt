@@ -24,6 +24,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import com.yausername.youtubedl_android.YoutubeDL
 import io.github.doromere.downloader.data.DownloadRepository
@@ -60,6 +61,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val openCookiesLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            importCookiesUri(uri)
+        }
+    }
+
+    private val openFolderLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            applyCustomFolderUri(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestNeededPermissions()
@@ -92,6 +109,23 @@ class MainActivity : ComponentActivity() {
                         openPlaylistLauncher.launch(
                             arrayOf("text/plain", "text/csv", "text/comma-separated-values", "application/csv")
                         )
+                    },
+                    onImportCookies = {
+                        openCookiesLauncher.launch(arrayOf("text/plain", "text/*"))
+                    },
+                    onClearCookies = {
+                        DownloadRepository.clearCookies()
+                        statusBanner = "Cookies удалены"
+                    },
+                    onPickSaveFolder = {
+                        openFolderLauncher.launch(null)
+                    },
+                    onResetSaveFolder = {
+                        val cur = DownloadRepository.settings.value
+                        DownloadRepository.updateSettings(
+                            cur.copy(customFolderUri = null, customFolderLabel = null)
+                        )
+                        statusBanner = "Папка сохранения сброшена на стандартную"
                     },
                     onOpenTask = { task -> openSavedTask(task) },
                     onCancelTask = { id -> DownloadService.cancel(this, id) },
@@ -209,6 +243,41 @@ class MainActivity : ComponentActivity() {
             }
         }.onFailure {
             statusBanner = "Ошибка чтения файла: ${it.message}"
+        }
+    }
+
+    private fun importCookiesUri(uri: Uri) {
+        runCatching {
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("Не удалось прочитать файл")
+            val text = PlaylistDumpParser.decodeBytes(bytes)
+            val hasNetscape = text.lineSequence().any { line ->
+                val t = line.trim()
+                t.startsWith("# Netscape") || t.startsWith("# HTTP Cookie") || t.count { it == '\t' } >= 5
+            }
+            if (!hasNetscape) {
+                statusBanner = "Файл не похож на Netscape cookies.txt"
+                return
+            }
+            DownloadRepository.saveCookies(text)
+            statusBanner = "Cookies импортированы (${bytes.size / 1024} КБ)"
+        }.onFailure {
+            statusBanner = "Ошибка импорта cookies: ${it.message}"
+        }
+    }
+
+    private fun applyCustomFolderUri(uri: Uri) {
+        runCatching {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            contentResolver.takePersistableUriPermission(uri, flags)
+            val label = DocumentFile.fromTreeUri(this, uri)?.name ?: uri.lastPathSegment ?: "Выбранная папка"
+            val cur = DownloadRepository.settings.value
+            DownloadRepository.updateSettings(
+                cur.copy(customFolderUri = uri.toString(), customFolderLabel = label)
+            )
+            statusBanner = "Папка сохранения: $label"
+        }.onFailure {
+            statusBanner = "Не удалось закрепить доступ к папке: ${it.message}"
         }
     }
 

@@ -3,11 +3,13 @@ package io.github.doromere.downloader.data
 import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
+import androidx.documentfile.provider.DocumentFile
 import java.io.File
 
 data class SavedFile(
@@ -28,6 +30,14 @@ object StorageSaver {
             .filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
             .toList()
         if (files.isEmpty()) return emptyList()
+
+        val treeUriStr = DownloadRepository.settings.value.customFolderUri
+        if (!treeUriStr.isNullOrBlank()) {
+            val safSaved = runCatching {
+                saveToSafTree(context, Uri.parse(treeUriStr), files, serviceFolder, subFolder)
+            }.getOrNull()
+            if (!safSaved.isNullOrEmpty()) return safSaved
+        }
 
         val relFolder = buildString {
             append(Environment.DIRECTORY_DOWNLOADS)
@@ -71,6 +81,38 @@ object StorageSaver {
                 }.getOrNull()
                 saved.add(SavedFile(targetFile.absolutePath, uri, mime))
             }
+        }
+        return saved
+    }
+
+    private fun saveToSafTree(
+        context: Context,
+        treeUri: Uri,
+        files: List<File>,
+        serviceFolder: String,
+        subFolder: String?
+    ): List<SavedFile> {
+        var dir = DocumentFile.fromTreeUri(context, treeUri) ?: return emptyList()
+        if (!dir.canWrite()) return emptyList()
+
+        val segments = listOfNotNull(
+            sanitizeSegment(serviceFolder),
+            subFolder?.takeIf { it.isNotBlank() }?.let { sanitizeSegment(it) }
+        )
+        for (seg in segments) {
+            dir = dir.findFile(seg)?.takeIf { it.isDirectory } ?: dir.createDirectory(seg) ?: return emptyList()
+        }
+
+        val labelPrefix = (DownloadRepository.settings.value.customFolderLabel ?: "Папка") +
+            "/" + segments.joinToString("/")
+        val saved = mutableListOf<SavedFile>()
+        for (file in files) {
+            val mime = guessMime(file)
+            val created = dir.createFile(mime, file.name) ?: continue
+            context.contentResolver.openOutputStream(created.uri)?.use { out ->
+                file.inputStream().use { inp -> inp.copyTo(out) }
+            }
+            saved.add(SavedFile("$labelPrefix/${file.name}", created.uri.toString(), mime))
         }
         return saved
     }

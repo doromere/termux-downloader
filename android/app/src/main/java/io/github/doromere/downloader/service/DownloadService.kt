@@ -163,8 +163,13 @@ class DownloadService : Service() {
             ) {
                 return
             }
-            val msg = e.message?.take(180) ?: "Неизвестная ошибка"
-            failTask(task, msg)
+            val msg = e.message?.lineSequence()?.firstOrNull { it.isNotBlank() }?.take(180) ?: "Неизвестная ошибка"
+            val fullLog = buildString {
+                if (!e.message.isNullOrBlank()) appendLine(e.message)
+                appendLine()
+                append(e.stackTraceToString().take(4000))
+            }.trim()
+            failTask(task, msg, fullLog)
         } finally {
             staging.deleteRecursively()
         }
@@ -402,6 +407,15 @@ class DownloadService : Service() {
         }
     }
 
+    private fun applyCommonOptions(req: YoutubeDLRequest) {
+        DownloadRepository.cookiesFile()?.let { cookies ->
+            req.addOption("--cookies", cookies.absolutePath)
+        }
+        if (DownloadRepository.settings.value.useAria2c) {
+            req.addOption("--downloader", "libaria2c.so")
+        }
+    }
+
     private fun buildVideoRequest(url: String, staging: File, quality: VideoQuality): YoutubeDLRequest {
         val sort = when (quality) {
             VideoQuality.Q1080 -> "res:1080,ext:mp4:m4a"
@@ -417,6 +431,7 @@ class DownloadService : Service() {
             addOption("-S", sort)
             addOption("--merge-output-format", "mp4")
             addOption("-o", File(staging, "%(title).120B.%(ext)s").absolutePath)
+            applyCommonOptions(this)
         }
     }
 
@@ -445,6 +460,7 @@ class DownloadService : Service() {
                 }
             }
             addOption("-o", File(staging, "%(title).120B.%(ext)s").absolutePath)
+            applyCommonOptions(this)
         }
     }
 
@@ -514,9 +530,9 @@ class DownloadService : Service() {
         }
     }
 
-    private fun failTask(task: DownloadTask, msg: String) {
+    private fun failTask(task: DownloadTask, msg: String, errorLog: String? = null) {
         DownloadRepository.updateTask(task.id) {
-            it.copy(status = DownloadStatus.FAILED, detail = msg)
+            it.copy(status = DownloadStatus.FAILED, detail = msg, errorLog = errorLog ?: msg)
         }
         postResultNotification("${task.service}: ошибка", msg)
     }

@@ -43,6 +43,7 @@ data class DownloadTask(
     val status: DownloadStatus = DownloadStatus.QUEUED,
     val progress: Float = 0f,
     val detail: String = "В очереди",
+    val errorLog: String? = null,
     val savedPath: String? = null,
     val savedUri: String? = null,
     val tracks: List<TrackProgress> = emptyList(),
@@ -51,5 +52,8 @@ data class DownloadTask(
 
 data class AppSettings(
     val defaultQuality: VideoQuality = VideoQuality.BEST,
-    val audioFormat: AudioFormat = AudioFormat.MP3
+    val audioFormat: AudioFormat = AudioFormat.MP3,
+    val customFolderUri: String? = null,
+    val customFolderLabel: String? = null,
+    val useAria2c: Boolean = false
 )
