@@ -3,8 +3,10 @@ package io.github.doromere.downloader
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -26,6 +28,9 @@ import androidx.lifecycle.lifecycleScope
 import com.yausername.youtubedl_android.YoutubeDL
 import io.github.doromere.downloader.data.DownloadRepository
 import io.github.doromere.downloader.data.DownloadTask
+import io.github.doromere.downloader.domain.DownloadKind
+import io.github.doromere.downloader.domain.ParsedPlaylist
+import io.github.doromere.downloader.domain.PlaylistDumpParser
 import io.github.doromere.downloader.domain.ServiceMatch
 import io.github.doromere.downloader.domain.UrlRouter
 import io.github.doromere.downloader.domain.VideoQuality
@@ -40,10 +45,19 @@ class MainActivity : ComponentActivity() {
     private var statusBanner by mutableStateOf<String?>(null)
     private var isUpdatingYtDlp by mutableStateOf(false)
     private var pendingMassConfirmation by mutableStateOf<Pair<List<ServiceMatch>, VideoQuality>?>(null)
+    private var pendingPlaylistConfirmation by mutableStateOf<ParsedPlaylist?>(null)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { }
+
+    private val openPlaylistLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            importPlaylistUri(uri)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,12 +87,27 @@ class MainActivity : ComponentActivity() {
                     statusBanner = statusBanner,
                     isUpdatingYtDlp = isUpdatingYtDlp,
                     onStartDownload = { raw, quality -> submitInput(raw, quality) },
+                    onImportPlaylist = {
+                        openPlaylistLauncher.launch(
+                            arrayOf("text/plain", "text/csv", "text/comma-separated-values", "application/csv")
+                        )
+                    },
+                    onOpenTask = { task -> openSavedTask(task) },
                     onCancelTask = { id -> DownloadService.cancel(this, id) },
                     onRetryTask = { task ->
-                        enqueueMatch(
-                            ServiceMatch(task.url, task.service, task.kind, false),
-                            task.quality
-                        )
+                        if (task.kind == DownloadKind.PLAYLIST_DUMP) {
+                            val loaded = DownloadRepository.loadPlaylistTracks(task.id)
+                            if (loaded != null) {
+                                enqueuePlaylist(ParsedPlaylist(loaded.folderName ?: "Playlist", "DUMP", loaded.tracks))
+                            } else {
+                                statusBanner = "Исходный список треков не найден — импортируйте файл снова."
+                            }
+                        } else {
+                            enqueueMatch(
+                                ServiceMatch(task.url, task.service, task.kind, false),
+                                task.quality
+                            )
+                        }
                     },
                     onRemoveTask = { id -> DownloadRepository.removeTask(id) },
                     onClearFinished = { DownloadRepository.clearFinished() },
@@ -109,6 +138,29 @@ class MainActivity : ComponentActivity() {
                         }
                     )
                 }
+
+                pendingPlaylistConfirmation?.let { parsed ->
+                    AlertDialog(
+                        onDismissRequest = { pendingPlaylistConfirmation = null },
+                        title = { Text("Импорт плейлиста (${parsed.kind})") },
+                        text = {
+                            Text("«${parsed.name}» — найдено треков: ${parsed.tracks.size}. Скачать аудио с YouTube?")
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                pendingPlaylistConfirmation = null
+                                enqueuePlaylist(parsed)
+                            }) {
+                                Text("Скачать")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { pendingPlaylistConfirmation = null }) {
+                                Text("Отмена")
+                            }
+                        }
+                    )
+                }
             }
         }
     }
@@ -118,8 +170,19 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
     }
 
+    @Suppress("DEPRECATION")
     private fun handleIncomingIntent(intent: Intent?) {
-        if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
+        if (intent?.action != Intent.ACTION_SEND) return
+        val streamUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        }
+        if (streamUri != null) {
+            importPlaylistUri(streamUri)
+            return
+        }
+        if (intent.type == "text/plain") {
             val shared = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
             val urls = UrlRouter.extractUrls(shared)
             if (urls.isNotEmpty()) {
@@ -129,6 +192,47 @@ class MainActivity : ComponentActivity() {
             } else if (shared.isNotBlank()) {
                 inputUrl = shared.trim()
             }
+        }
+    }
+
+    private fun importPlaylistUri(uri: Uri) {
+        runCatching {
+            val name = queryDisplayName(uri) ?: "playlist.csv"
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("Не удалось прочитать файл")
+            val parsed = PlaylistDumpParser.parse(bytes, name)
+            if (parsed.tracks.isEmpty()) {
+                statusBanner = "В файле не найдено треков: $name"
+            } else {
+                pendingPlaylistConfirmation = parsed
+            }
+        }.onFailure {
+            statusBanner = "Ошибка чтения файла: ${it.message}"
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) return c.getString(idx)
+            }
+        }
+        return uri.lastPathSegment
+    }
+
+    private fun openSavedTask(task: DownloadTask) {
+        val uriStr = task.savedUri ?: return
+        val uri = Uri.parse(uriStr)
+        val mime = contentResolver.getType(uri) ?: "*/*"
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching {
+            startActivity(Intent.createChooser(viewIntent, "Открыть файл"))
+        }.onFailure {
+            statusBanner = "Нет приложения для открытия файла (${task.savedPath ?: uriStr})"
         }
     }
 
@@ -158,6 +262,21 @@ class MainActivity : ComponentActivity() {
             quality = quality,
             audioFormat = audioFmt
         )
+        DownloadRepository.enqueue(task)
+        DownloadService.enqueue(this, task.id)
+    }
+
+    private fun enqueuePlaylist(parsed: ParsedPlaylist) {
+        val audioFmt = DownloadRepository.settings.value.audioFormat
+        val task = DownloadTask(
+            url = "playlist://${parsed.name} (${parsed.tracks.size})",
+            service = "Playlists",
+            kind = DownloadKind.PLAYLIST_DUMP,
+            quality = VideoQuality.AUDIO_ONLY,
+            audioFormat = audioFmt,
+            detail = "Треков: ${parsed.tracks.size}"
+        )
+        DownloadRepository.savePlaylistTracks(task.id, parsed.name, parsed.tracks)
         DownloadRepository.enqueue(task)
         DownloadService.enqueue(this, task.id)
     }

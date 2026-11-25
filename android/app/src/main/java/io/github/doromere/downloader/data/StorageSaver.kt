@@ -7,7 +7,14 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import java.io.File
+
+data class SavedFile(
+    val displayPath: String,
+    val contentUri: String?,
+    val mimeType: String
+)
 
 object StorageSaver {
 
@@ -16,8 +23,10 @@ object StorageSaver {
         stagingDir: File,
         serviceFolder: String,
         subFolder: String? = null
-    ): List<String> {
-        val files = stagingDir.walkTopDown().filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }.toList()
+    ): List<SavedFile> {
+        val files = stagingDir.walkTopDown()
+            .filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
+            .toList()
         if (files.isEmpty()) return emptyList()
 
         val relFolder = buildString {
@@ -30,7 +39,7 @@ object StorageSaver {
             }
         }
 
-        val savedNames = mutableListOf<String>()
+        val saved = mutableListOf<SavedFile>()
         for (file in files) {
             val mime = guessMime(file)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -49,7 +58,7 @@ object StorageSaver {
                     values.clear()
                     values.put(MediaStore.Downloads.IS_PENDING, 0)
                     resolver.update(uri, values, null, null)
-                    savedNames.add("$relFolder/${file.name}")
+                    saved.add(SavedFile("$relFolder/${file.name}", uri.toString(), mime))
                 }
             } else {
                 @Suppress("DEPRECATION")
@@ -57,10 +66,13 @@ object StorageSaver {
                 val targetFile = uniqueTarget(targetDir, file.name)
                 file.copyTo(targetFile, overwrite = false)
                 MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), arrayOf(mime), null)
-                savedNames.add(targetFile.absolutePath)
+                val uri = runCatching {
+                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", targetFile).toString()
+                }.getOrNull()
+                saved.add(SavedFile(targetFile.absolutePath, uri, mime))
             }
         }
-        return savedNames
+        return saved
     }
 
     private fun uniqueTarget(dir: File, name: String): File {

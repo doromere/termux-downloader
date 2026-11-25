@@ -13,10 +13,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -63,6 +65,8 @@ fun DownloaderScreen(
     statusBanner: String?,
     isUpdatingYtDlp: Boolean,
     onStartDownload: (String, VideoQuality) -> Unit,
+    onImportPlaylist: () -> Unit,
+    onOpenTask: (DownloadTask) -> Unit,
     onCancelTask: (String) -> Unit,
     onRetryTask: (DownloadTask) -> Unit,
     onRemoveTask: (String) -> Unit,
@@ -158,14 +162,24 @@ fun DownloaderScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Button(
-                onClick = { onStartDownload(inputUrl, selectedQuality) },
-                enabled = inputUrl.isNotBlank(),
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Icon(Icons.Default.Download, contentDescription = null)
-                Spacer(modifier = Modifier.padding(horizontal = 4.dp))
-                Text("Скачать")
+                Button(
+                    onClick = { onStartDownload(inputUrl, selectedQuality) },
+                    enabled = inputUrl.isNotBlank(),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = null)
+                    Spacer(modifier = Modifier.padding(horizontal = 4.dp))
+                    Text("Скачать")
+                }
+                OutlinedButton(onClick = onImportPlaylist) {
+                    Icon(Icons.Default.PlaylistAdd, contentDescription = null)
+                    Spacer(modifier = Modifier.padding(horizontal = 4.dp))
+                    Text("CSV/TXT")
+                }
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -190,6 +204,7 @@ fun DownloaderScreen(
                     items(tasks, key = { it.id }) { task ->
                         TaskCard(
                             task = task,
+                            onOpen = { onOpenTask(task) },
                             onCancel = { onCancelTask(task.id) },
                             onRetry = { onRetryTask(task) },
                             onRemove = { onRemoveTask(task.id) }
@@ -217,6 +232,7 @@ fun DownloaderScreen(
 @Composable
 private fun TaskCard(
     task: DownloadTask,
+    onOpen: () -> Unit,
     onCancel: () -> Unit,
     onRetry: () -> Unit,
     onRemove: () -> Unit
@@ -238,6 +254,11 @@ private fun TaskCard(
                             Icon(Icons.Default.Close, contentDescription = "Отменить")
                         }
                     } else {
+                        if (task.status == DownloadStatus.COMPLETED && task.savedUri != null) {
+                            IconButton(onClick = onOpen) {
+                                Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Открыть")
+                            }
+                        }
                         if (task.status == DownloadStatus.FAILED || task.status == DownloadStatus.CANCELLED) {
                             IconButton(onClick = onRetry) {
                                 Icon(Icons.Default.Refresh, contentDescription = "Повторить")

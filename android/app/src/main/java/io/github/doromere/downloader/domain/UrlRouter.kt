@@ -19,6 +19,7 @@ enum class DownloadKind {
     VIDEO,
     AUDIO,
     MUSIC_CATALOG,
+    PLAYLIST_DUMP,
     DIRECT_FILE,
     DRM_BLOCKED,
     UNSUPPORTED_MUSIC,

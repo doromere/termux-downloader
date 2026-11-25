@@ -24,6 +24,7 @@ data class DownloadTask(
     val progress: Float = 0f,
     val detail: String = "В очереди",
     val savedPath: String? = null,
+    val savedUri: String? = null,
     val createdAt: Long = System.currentTimeMillis()
 )
 

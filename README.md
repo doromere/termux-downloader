@@ -159,6 +159,12 @@ YouTube требует JavaScript-движок. Deno (и `spotdl --download-deno
   `http(s)://`, `magnet:` и «голые» домены (им дописывается `https://`); всё, что похоже на опцию
   (`--exec=…`), отклоняется, а «массовые» загрузки требуют подтверждения.
 
-## Android-приложение (без Termux, в разработке)
+## Android-приложение (без Termux)
 
-В каталоге [android/](android/) находится нативное Android-приложение на **Kotlin + Jetpack Compose + `youtubedl-android`** (`yt-dlp` + `ffmpeg` + `aria2c`), с приёмом ссылок через «Поделиться», `ForegroundService`, живыми уведомлениями и сохранением через MediaStore/Downloads. Debug APK собирается автоматически в GitHub Actions ([android.yml](.github/workflows/android.yml)).
+В каталоге [android/](android/) находится нативное Android-приложение на **Kotlin + Jetpack Compose + `youtubedl-android`** (`yt-dlp` + `ffmpeg` + `aria2c`):
+- приём ссылок и `.csv`/`.txt`-плейлистов через системное меню «Поделиться» или кнопку `CSV/TXT`;
+- фоновый `ForegroundService` с прогрессом и отменой из уведомления;
+- сохранение в `Download/Termux Downloads/` через `MediaStore` и кнопка открытия файла;
+- split-APK по архитектурам (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64` + `universal`).
+
+Сборка Debug APK запускается автоматически в [android.yml](.github/workflows/android.yml), а релизные APK по тегу `v*` публикуются в **GitHub Releases** ([release-android.yml](.github/workflows/release-android.yml)) — обновления удобно отслеживать через **Obtainium**.

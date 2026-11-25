@@ -14,6 +14,7 @@ import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import io.github.doromere.downloader.DownloaderApplication
 import io.github.doromere.downloader.MainActivity
+import io.github.doromere.downloader.data.CatalogTrack
 import io.github.doromere.downloader.data.DownloadRepository
 import io.github.doromere.downloader.data.DownloadStatus
 import io.github.doromere.downloader.data.DownloadTask
@@ -107,6 +108,10 @@ class DownloadService : Service() {
                     downloadMusicCatalog(task, staging)
                     return
                 }
+                DownloadKind.PLAYLIST_DUMP -> {
+                    downloadPlaylistDump(task, staging)
+                    return
+                }
                 DownloadKind.AUDIO -> downloadWithYtDlp(task, task.url, staging, audioOnly = true)
                 DownloadKind.VIDEO, DownloadKind.GENERIC -> {
                     val audioOnly = task.quality == VideoQuality.AUDIO_ONLY
@@ -124,15 +129,17 @@ class DownloadService : Service() {
             if (saved.isEmpty()) {
                 failTask(task, "Файл не был создан загрузчиком")
             } else {
+                val first = saved.first()
                 DownloadRepository.updateTask(task.id) {
                     it.copy(
                         status = DownloadStatus.COMPLETED,
                         progress = 100f,
                         detail = "Сохранено (${saved.size} файл.)",
-                        savedPath = saved.first()
+                        savedPath = first.displayPath,
+                        savedUri = first.contentUri
                     )
                 }
-                postResultNotification(task.service, "Готово: ${saved.first().substringAfterLast('/')}")
+                postResultNotification(task.service, "Готово: ${first.displayPath.substringAfterLast('/')}")
             }
         } catch (e: InterruptedException) {
             DownloadRepository.updateTask(task.id) {
@@ -154,16 +161,31 @@ class DownloadService : Service() {
     private fun downloadMusicCatalog(task: DownloadTask, staging: File) {
         DownloadRepository.updateTask(task.id) { it.copy(detail = "Запрос треклиста…") }
         val catalog = MusicCatalogResolver.resolve(task.url)
-        val total = catalog.tracks.size
+        downloadTrackList(task, staging, catalog.folderName, catalog.tracks)
+    }
+
+    private fun downloadPlaylistDump(task: DownloadTask, staging: File) {
+        val loaded = DownloadRepository.loadPlaylistTracks(task.id)
+            ?: throw IllegalStateException("Список треков не найден")
+        downloadTrackList(task, staging, loaded.folderName, loaded.tracks)
+    }
+
+    private fun downloadTrackList(
+        task: DownloadTask,
+        staging: File,
+        folderName: String?,
+        tracks: List<CatalogTrack>
+    ) {
+        val total = tracks.size
         if (total == 0) throw IllegalStateException("Список треков пуст")
 
-        val targetDir = if (!catalog.folderName.isNullOrBlank()) {
-            File(staging, catalog.folderName.replace(Regex("""[\\/:*?"<>|]+"""), "_")).apply { mkdirs() }
+        val targetDir = if (!folderName.isNullOrBlank()) {
+            File(staging, folderName.replace(Regex("""[\\/:*?"<>|]+"""), "_")).apply { mkdirs() }
         } else {
             staging
         }
 
-        for ((idx, track) in catalog.tracks.withIndex()) {
+        for ((idx, track) in tracks.withIndex()) {
             if (cancelledIds.contains(task.id) ||
                 DownloadRepository.getTask(task.id)?.status == DownloadStatus.CANCELLED
             ) {
@@ -185,14 +207,16 @@ class DownloadService : Service() {
                 YoutubeDL.getInstance().execute(request, task.id) { _, _, _ -> }
             }
         }
-        val saved = StorageSaver.saveFilesToDownloads(this, targetDir, task.service, catalog.folderName)
+        val saved = StorageSaver.saveFilesToDownloads(this, targetDir, task.service, folderName)
         if (saved.isEmpty()) throw IllegalStateException("Не удалось скачать треки с YouTube")
+        val first = saved.first()
         DownloadRepository.updateTask(task.id) {
             it.copy(
                 status = DownloadStatus.COMPLETED,
                 progress = 100f,
                 detail = "Сохранено (${saved.size} из $total)",
-                savedPath = saved.first()
+                savedPath = first.displayPath,
+                savedUri = first.contentUri
             )
         }
         postResultNotification(task.service, "Скачано ${saved.size} треков → ${task.service}")

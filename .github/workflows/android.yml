@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -31,11 +31,11 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Run unit tests and build Debug APK
+      - name: Run unit tests and build Debug APKs
         run: gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
 
-      - name: Upload Debug APK
+      - name: Upload Debug APKs
         uses: actions/upload-artifact@v4
         with:
-          name: termux-downloader-debug-apk
+          name: termux-downloader-debug-apks
           path: android/app/build/outputs/apk/debug/*.apk

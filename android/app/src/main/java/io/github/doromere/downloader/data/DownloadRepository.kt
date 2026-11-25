@@ -53,14 +53,57 @@ object DownloadRepository {
         saveHistory()
     }
 
+    fun savePlaylistTracks(taskId: String, folderName: String, tracks: List<CatalogTrack>) {
+        if (!::appContext.isInitialized) return
+        val dir = File(appContext.filesDir, "playlists").apply { mkdirs() }
+        val arr = JSONArray()
+        for (t in tracks) {
+            arr.put(JSONObject().apply {
+                put("title", t.title)
+                put("artist", t.artist)
+            })
+        }
+        val payload = JSONObject().apply {
+            put("name", folderName)
+            put("tracks", arr)
+        }
+        File(dir, "$taskId.json").writeText(payload.toString(), Charsets.UTF_8)
+    }
+
+    fun loadPlaylistTracks(taskId: String): CatalogResult? {
+        if (!::appContext.isInitialized) return null
+        val f = File(appContext.filesDir, "playlists/$taskId.json")
+        if (!f.isFile) return null
+        return runCatching {
+            val obj = JSONObject(f.readText(Charsets.UTF_8))
+            val name = obj.optString("name").ifBlank { "Playlist" }
+            val arr = obj.optJSONArray("tracks") ?: return null
+            val list = ArrayList<CatalogTrack>(arr.length())
+            for (i in 0 until arr.length()) {
+                val item = arr.getJSONObject(i)
+                list.add(CatalogTrack(item.optString("title"), item.optString("artist")))
+            }
+            CatalogResult(name, list)
+        }.getOrNull()
+    }
+
     fun removeTask(id: String) {
         _tasks.update { list -> list.filterNot { it.id == id } }
+        if (::appContext.isInitialized) {
+            File(appContext.filesDir, "playlists/$id.json").delete()
+        }
         saveHistory()
     }
 
     fun clearFinished() {
+        val removedIds = _tasks.value
+            .filter { it.status != DownloadStatus.QUEUED && it.status != DownloadStatus.RUNNING }
+            .map { it.id }
         _tasks.update { list ->
             list.filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.RUNNING }
+        }
+        if (::appContext.isInitialized) {
+            removedIds.forEach { File(appContext.filesDir, "playlists/$it.json").delete() }
         }
         saveHistory()
     }
@@ -95,6 +138,7 @@ object DownloadRepository {
                     put("progress", t.progress.toDouble())
                     put("detail", t.detail)
                     put("savedPath", t.savedPath ?: JSONObject.NULL)
+                    put("savedUri", t.savedUri ?: JSONObject.NULL)
                     put("createdAt", t.createdAt)
                 }
             )
@@ -132,6 +176,7 @@ object DownloadRepository {
                         progress = o.optDouble("progress", 0.0).toFloat(),
                         detail = detail,
                         savedPath = if (o.isNull("savedPath")) null else o.optString("savedPath"),
+                        savedUri = if (o.isNull("savedUri")) null else o.optString("savedUri"),
                         createdAt = o.optLong("createdAt", System.currentTimeMillis())
                     )
                 )
