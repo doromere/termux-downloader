@@ -81,6 +81,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         requestNeededPermissions()
         handleIncomingIntent(intent)
+        maybeAutoUpdateYtDlp()
 
         val app = application as DownloaderApplication
         setContent {
@@ -353,6 +354,19 @@ class MainActivity : ComponentActivity() {
         DownloadRepository.savePlaylistTracks(task.id, parsed.name, parsed.tracks)
         DownloadRepository.enqueue(task)
         DownloadService.enqueue(this, task.id)
+    }
+
+    private fun maybeAutoUpdateYtDlp() {
+        val prefs = getSharedPreferences("downloader_prefs", MODE_PRIVATE)
+        val lastCheck = prefs.getLong("last_ytdlp_update_ms", 0L)
+        val now = System.currentTimeMillis()
+        if (now - lastCheck < 24L * 60L * 60L * 1000L) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                YoutubeDL.getInstance().updateYoutubeDL(applicationContext, YoutubeDL.UpdateChannel.STABLE)
+                prefs.edit().putLong("last_ytdlp_update_ms", System.currentTimeMillis()).apply()
+            }
+        }
     }
 
     private fun updateYtDlp() {

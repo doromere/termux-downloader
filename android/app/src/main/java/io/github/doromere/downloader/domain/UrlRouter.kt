@@ -194,7 +194,9 @@ object UrlRouter {
             return ServiceMatch(url, svc, DownloadKind.UNSUPPORTED_MUSIC, isMass(url))
         }
         if (host.startsWith("music.yandex.")) {
-            return ServiceMatch(url, "Yandex Music", DownloadKind.AUDIO, false)
+            val isYandexCollection = (url.contains("/album/") && !url.contains("/track/")) ||
+                url.contains("/playlists/")
+            return ServiceMatch(url, "Yandex Music", DownloadKind.AUDIO, isYandexCollection)
         }
         audioDomains.entries.firstOrNull { matchHost(host, it.key) }?.let { (_, svc) ->
             return ServiceMatch(url, svc, DownloadKind.AUDIO, isMass(url))

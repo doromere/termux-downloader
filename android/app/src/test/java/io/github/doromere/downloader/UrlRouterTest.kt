@@ -56,5 +56,14 @@ class UrlRouterTest {
         val file = UrlRouter.classify("https://example.com/app.apk?v=2")
         assertEquals("Files", file!!.service)
         assertEquals(DownloadKind.DIRECT_FILE, file.kind)
+
+        val ymTrack = UrlRouter.classify("https://music.yandex.ru/album/123/track/456")
+        assertEquals("Yandex Music", ymTrack!!.service)
+        assertEquals(DownloadKind.AUDIO, ymTrack.kind)
+        assertFalse(ymTrack.isMass)
+
+        val ymAlbum = UrlRouter.classify("https://music.yandex.ru/album/123")
+        assertEquals("Yandex Music", ymAlbum!!.service)
+        assertTrue(ymAlbum.isMass)
     }
 }

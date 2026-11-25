@@ -32,7 +32,83 @@ object MusicCatalogResolver {
         if (host in setOf("music.apple.com", "itunes.apple.com", "geo.music.apple.com")) {
             return resolveApple(target)
         }
+        if (host.startsWith("music.yandex.")) {
+            return resolveYandex(target)
+        }
         throw IllegalArgumentException("Сервис не поддерживается через открытый API")
+    }
+
+    private val yandexTrackRegex = Regex("""/track/(\d+)""")
+    private val yandexAlbumRegex = Regex("""/album/(\d+)""")
+    private val yandexPlaylistRegex = Regex("""/users/([^/]+)/playlists/(\d+)""")
+
+    fun resolveYandex(urlStr: String): CatalogResult {
+        val base = "https://music.yandex.ru"
+        val tm = yandexTrackRegex.find(urlStr)
+        if (tm != null) {
+            val tid = tm.groupValues[1]
+            val obj = httpJson("$base/handlers/track.jsx?track=$tid")
+            val tr = obj.optJSONObject("track") ?: throw IllegalStateException("Яндекс Музыка не отдала трек (капча или нет доступа)")
+            val title = tr.optString("title")
+            if (title.isBlank()) throw IllegalStateException("Пустое название трека в ответе Яндекса")
+            val artists = parseYandexArtists(tr)
+            return CatalogResult(null, listOf(CatalogTrack(title, artists)))
+        }
+        val am = yandexAlbumRegex.find(urlStr)
+        if (am != null) {
+            val aid = am.groupValues[1]
+            val obj = httpJson("$base/handlers/album.jsx?album=$aid")
+            val albumTitle = obj.optString("title").ifBlank { "Yandex Album $aid" }
+            val albumArtist = parseYandexArtists(obj)
+            val tracks = parseYandexVolumes(obj)
+            if (tracks.isEmpty()) throw IllegalStateException("Яндекс Музыка не отдала треки альбома (возможна капча)")
+            val folder = listOf(albumArtist, albumTitle).filter { it.isNotBlank() }.joinToString(" - ")
+            return CatalogResult(folder, tracks)
+        }
+        val pm = yandexPlaylistRegex.find(urlStr)
+        if (pm != null) {
+            val owner = URLEncoder.encode(pm.groupValues[1], "UTF-8")
+            val kinds = pm.groupValues[2]
+            val obj = httpJson("$base/handlers/playlist.jsx?owner=$owner&kinds=$kinds")
+            val pl = obj.optJSONObject("playlist") ?: throw IllegalStateException("Яндекс Музыка не отдала плейлист")
+            val title = pl.optString("title").ifBlank { "Yandex Playlist $kinds" }
+            val arr = pl.optJSONArray("tracks")
+            val tracks = mutableListOf<CatalogTrack>()
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val t = arr.optJSONObject(i) ?: continue
+                    val tName = t.optString("title")
+                    if (tName.isNotBlank()) tracks.add(CatalogTrack(tName, parseYandexArtists(t)))
+                }
+            }
+            if (tracks.isEmpty()) throw IllegalStateException("Плейлист пуст или скрыт")
+            return CatalogResult(title, tracks)
+        }
+        throw IllegalArgumentException("Не удалось распознать ссылку Яндекс Музыки")
+    }
+
+    private fun parseYandexArtists(obj: JSONObject): String {
+        val arr = obj.optJSONArray("artists") ?: return ""
+        val names = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val n = arr.optJSONObject(i)?.optString("name").orEmpty()
+            if (n.isNotBlank()) names.add(n)
+        }
+        return names.joinToString(", ")
+    }
+
+    private fun parseYandexVolumes(obj: JSONObject): List<CatalogTrack> {
+        val vols = obj.optJSONArray("volumes") ?: return emptyList()
+        val tracks = mutableListOf<CatalogTrack>()
+        for (v in 0 until vols.length()) {
+            val arr = vols.optJSONArray(v) ?: continue
+            for (i in 0 until arr.length()) {
+                val t = arr.optJSONObject(i) ?: continue
+                val title = t.optString("title")
+                if (title.isNotBlank()) tracks.add(CatalogTrack(title, parseYandexArtists(t)))
+            }
+        }
+        return tracks
     }
 
     private fun resolveDeezer(kind: String, id: String): CatalogResult {

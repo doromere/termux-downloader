@@ -7,7 +7,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.yausername.youtubedl_android.YoutubeDL
@@ -36,10 +38,13 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 class DownloadService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val queue = Channel<String>(Channel.UNLIMITED)
+    private val pendingTasks = AtomicInteger(0)
     private val cancelledIds = ConcurrentHashMap.newKeySet<String>()
     private var workerJob: Job? = null
 
@@ -47,13 +52,26 @@ class DownloadService : Service() {
         super.onCreate()
         workerJob = serviceScope.launch {
             for (taskId in queue) {
-                if (cancelledIds.remove(taskId)) continue
-                val task = DownloadRepository.getTask(taskId) ?: continue
-                if (task.status == DownloadStatus.CANCELLED) continue
-                runTask(task)
+                try {
+                    if (!cancelledIds.remove(taskId)) {
+                        val task = DownloadRepository.getTask(taskId)
+                        if (task != null && task.status != DownloadStatus.CANCELLED) {
+                            runTask(task)
+                        }
+                    }
+                } finally {
+                    if (pendingTasks.decrementAndGet() <= 0) {
+                        pendingTasks.set(0)
+                        mainHandler.post {
+                            if (pendingTasks.get() <= 0) {
+                                stopForeground(STOP_FOREGROUND_REMOVE)
+                                getSystemService(NotificationManager::class.java)?.cancel(NOTIF_PROGRESS_ID)
+                                stopSelf()
+                            }
+                        }
+                    }
+                }
             }
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
     }
 
@@ -71,12 +89,18 @@ class DownloadService : Service() {
                             it.copy(status = DownloadStatus.CANCELLED, detail = "Отменено")
                         }
                     }
+                    if (pendingTasks.get() <= 0) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        getSystemService(NotificationManager::class.java)?.cancel(NOTIF_PROGRESS_ID)
+                        stopSelf()
+                    }
                 }
                 return START_NOT_STICKY
             }
             ACTION_ENQUEUE -> {
                 val taskId = intent.getStringExtra(EXTRA_TASK_ID)
                 if (!taskId.isNullOrBlank()) {
+                    pendingTasks.incrementAndGet()
                     startForegroundCompat("Подготовка загрузки…", taskId, 0, indeterminate = true)
                     queue.trySend(taskId)
                 }
@@ -115,10 +139,35 @@ class DownloadService : Service() {
                     return
                 }
                 DownloadKind.AUDIO -> {
-                    if (isYtPlaylistUrl(task.url) && tryDownloadYtPlaylist(task, staging, audioOnly = true)) {
+                    if (task.service == "Yandex Music") {
+                        val yandexOk = runCatching {
+                            downloadWithYtDlp(task, task.url, staging, audioOnly = true)
+                            true
+                        }.getOrElse { ytErr ->
+                            if (cancelledIds.contains(task.id)) throw ytErr
+                            DownloadRepository.updateTask(task.id) {
+                                it.copy(detail = "Ищу треки через каталог Яндекс Музыки…")
+                            }
+                            runCatching {
+                                val catalog = MusicCatalogResolver.resolveYandex(task.url)
+                                downloadTrackList(task, staging, catalog.folderName, catalog.tracks)
+                                return
+                            }.onFailure { catErr ->
+                                throw IllegalStateException(
+                                    "yt-dlp: ${extractErrorSummary(ytErr.message)}\n" +
+                                        "Каталог Яндекса: ${catErr.message}\n" +
+                                        "Совет: импортируйте cookies.txt Яндекс Музыки в настройках.",
+                                    ytErr
+                                )
+                            }
+                            false
+                        }
+                        if (!yandexOk) return
+                    } else if (isYtPlaylistUrl(task.url) && tryDownloadYtPlaylist(task, staging, audioOnly = true)) {
                         return
+                    } else {
+                        downloadWithYtDlp(task, task.url, staging, audioOnly = true)
                     }
-                    downloadWithYtDlp(task, task.url, staging, audioOnly = true)
                 }
                 DownloadKind.VIDEO, DownloadKind.GENERIC -> {
                     val audioOnly = task.quality == VideoQuality.AUDIO_ONLY
@@ -163,7 +212,7 @@ class DownloadService : Service() {
             ) {
                 return
             }
-            val msg = e.message?.lineSequence()?.firstOrNull { it.isNotBlank() }?.take(180) ?: "Неизвестная ошибка"
+            val msg = extractErrorSummary(e.message)
             val fullLog = buildString {
                 if (!e.message.isNullOrBlank()) appendLine(e.message)
                 appendLine()
@@ -528,6 +577,17 @@ class DownloadService : Service() {
         } finally {
             activeConn.disconnect()
         }
+    }
+
+    private fun extractErrorSummary(raw: String?): String {
+        if (raw.isNullOrBlank()) return "Неизвестная ошибка"
+        val lines = raw.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+        val errLine = lines.firstOrNull { it.startsWith("ERROR:", ignoreCase = true) }
+        if (errLine != null) {
+            return errLine.removePrefix("ERROR:").trim().take(180).ifBlank { errLine.take(180) }
+        }
+        val nonWarn = lines.lastOrNull { !it.startsWith("WARNING:", ignoreCase = true) }
+        return (nonWarn ?: lines.last()).take(180)
     }
 
     private fun failTask(task: DownloadTask, msg: String, errorLog: String? = null) {
